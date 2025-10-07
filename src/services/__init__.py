@@ -3,7 +3,19 @@ Services package - Business logic and external integrations.
 """
 from .llm_service import llm_chat, LLMError
 
+
+from .booking_service import (
+    BookingService,
+    BookingServiceError,
+    ValidationError,
+    CapacityError,
+    DatabaseError
+)
+
 __all__ = [
-    "llm_chat",
-    "LLMError",
+    "BookingService",
+    "BookingServiceError",
+    "ValidationError",
+    "CapacityError",
+    "DatabaseError"
 ]
