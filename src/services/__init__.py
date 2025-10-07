@@ -1,8 +1,9 @@
 """
-Services package for restaurant booking system.
-
-This package contains business logic services.
+Services package - Business logic and external integrations.
 """
+from .llm_service import llm_chat, LLMError
+
+
 from .booking_service import (
     BookingService,
     BookingServiceError,
