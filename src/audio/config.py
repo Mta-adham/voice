@@ -1,7 +1,12 @@
 """
+Audio configuration settings for the voice assistant system.
+"""
+from dataclasses import dataclass, field
+=======
 Audio configuration constants and settings.
 """
 from dataclasses import dataclass
+
 from typing import Literal
 
 
