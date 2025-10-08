@@ -1,13 +1,9 @@
 """
-Notifications module for restaurant booking system.
+Notifications package for restaurant booking system.
 
-Handles SMS and email confirmations for bookings.
+Provides email and SMS notification services.
 """
-from notifications.sms import send_booking_sms, format_phone_number, validate_phone_number
-
-
-"""
-
+from .email_service import send_booking_email, EmailSendResult
 from .sms import send_sms_confirmation, SMSService, SMSError
 from .email import send_email_confirmation, EmailService, EmailError
 
@@ -18,4 +14,4 @@ __all__ = [
     "send_email_confirmation",
     "EmailService",
     "EmailError",
-]
+] 

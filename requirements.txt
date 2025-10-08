@@ -36,6 +36,10 @@ asyncio==3.4.3
 loguru==0.7.2
 tenacity==8.2.3  # For retry logic
 
+ # Email notifications
+sendgrid==6.11.0
+email-validator==2.1.0
+
 # Notifications
 twilio==8.10.0
 
