@@ -95,6 +95,30 @@ class Settings(BaseSettings):
         default="Street parking available. Valet service offered during dinner hours.",
         alias="DIRECTIONS_INFO",
         description="Directions and parking information"
+    # Twilio SMS Configuration
+    twilio_account_sid: Optional[str] = Field(
+        default=None,
+        alias="TWILIO_ACCOUNT_SID",
+        description="Twilio Account SID"
+    )
+    
+    twilio_auth_token: Optional[str] = Field(
+        default=None,
+        alias="TWILIO_AUTH_TOKEN",
+        description="Twilio Auth Token"
+    )
+    
+    twilio_phone_number: Optional[str] = Field(
+        default=None,
+        alias="TWILIO_PHONE_NUMBER",
+        description="Twilio phone number (sender)"
+    )
+    
+    # Restaurant Configuration
+    restaurant_name: str = Field(
+        default="Our Restaurant",
+        alias="RESTAURANT_NAME",
+        description="Restaurant name for confirmations"
     )
     
     class Config:
