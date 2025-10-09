@@ -196,6 +196,8 @@ class ElevenLabsTTS:
             return
         
         # Sort by access time (oldest first)
+        # st_atime is the last access time - we touch() files on cache hits,
+        # so this naturally implements LRU (Least Recently Used) eviction
         cache_files.sort(key=lambda f: f.stat().st_atime)
         
         current_size = self._get_cache_size()

@@ -269,13 +269,17 @@ class AudioManager:
         recent_audio = audio_data[-required_samples:]
         
         # Calculate RMS (Root Mean Square) energy
+        # RMS gives us the average "loudness" of the audio signal
         rms = np.sqrt(np.mean(recent_audio**2))
         
         # Avoid log(0) by adding small epsilon
+        # Very quiet audio could have RMS near zero, which would cause math errors
         if rms < 1e-10:
             db_level = -100.0
         else:
-            # Convert to dB scale
+            # Convert to dB scale (decibels)
+            # dB = 20 * log10(amplitude), standard audio measurement
+            # Typical speech is -30dB to -10dB, silence is < -40dB
             db_level = 20 * np.log10(rms)
         
         is_silent = db_level < threshold
@@ -314,6 +318,9 @@ class AudioManager:
         new_length = int(len(audio_data) * ratio)
         
         # Simple linear interpolation resampling
+        # We create new sample points evenly distributed across the original data
+        # np.interp then fills in values using linear interpolation
+        # This is faster than FFT-based resampling but lower quality (acceptable for speech)
         indices = np.linspace(0, len(audio_data) - 1, new_length)
         
         if audio_data.ndim == 1:
@@ -357,9 +364,11 @@ class AudioManager:
         
         if target_channels == 1 and current_channels == 2:
             # Stereo to mono: average channels
+            # Taking the mean of left and right channels preserves audio balance
             return np.mean(audio_data, axis=1)
         elif target_channels == 2 and current_channels == 1:
             # Mono to stereo: duplicate channel
+            # Create identical left and right channels for stereo output
             return np.column_stack([audio_data, audio_data])
         else:
             raise ValueError(f"Unsupported channel conversion: {current_channels} -> {target_channels}")

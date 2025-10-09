@@ -258,6 +258,9 @@ class BookingService:
                 raise ValidationError(error_msg)
             
             # Start atomic transaction - get time slot with row lock
+            # with_for_update() acquires a PostgreSQL row-level lock to prevent
+            # race conditions when multiple bookings are made simultaneously.
+            # This ensures that capacity checks and updates are atomic.
             time_slot = self.session.query(TimeSlot).filter(
                 and_(
                     TimeSlot.date == booking_data.date,
