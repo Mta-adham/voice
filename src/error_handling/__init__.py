@@ -1,5 +1,5 @@
 """
-Error handling module for restaurant booking system.
+ Error handling module for restaurant booking system.
 
 This module provides comprehensive error handling with:
 - Custom exception classes for all error types
@@ -12,8 +12,6 @@ This module provides comprehensive error handling with:
 from .exceptions import (
     # Base
     BookingSystemError,
-    
-    # Business Logic
     BookingValidationError,
     NoAvailabilityError,
     InvalidDateError,
@@ -27,22 +25,33 @@ from .exceptions import (
     UnclearAudioError,
     SilenceDetectedError,
     
-    # Technical
+    # Technical 
+    PartySizeTooLargeError,
+    
+    # Technical Errors
+    AudioProcessingError,
+    TranscriptionError,
+    TextToSpeechError, 
     LLMProviderError,
     DatabaseError,
     NotificationError,
     
-    # User Interaction
+     # User Interaction
     UserTimeoutError,
     AmbiguousInputError,
     UserInterruptionError,
     
     # System
-    ConfigurationError
+    ConfigurationError 
+    # User Interaction Errors
+    UserTimeoutError,
+    AmbiguousInputError,
+    InterruptionError, 
 )
 
 from .error_messages import (
     get_error_message,
+ 
     suggest_next_action,
     format_date_friendly,
     format_time_friendly
@@ -74,11 +83,23 @@ from .logging_config import (
     log_error_with_context,
     LogContext,
     log_performance
+=======
+    get_alternative_suggestions,
+    ErrorMessageGenerator,
+)
+
+from .handlers import (
+    handle_booking_error,
+    handle_audio_error,
+    handle_llm_error,
+    handle_database_error,
+    log_error_with_context,
+    ErrorHandler, 
 )
 
 __all__ = [
     # Exceptions
-    'BookingSystemError',
+     'BookingSystemError',
     'BookingValidationError',
     'NoAvailabilityError',
     'InvalidDateError',
@@ -126,5 +147,32 @@ __all__ = [
     'log_api_call',
     'log_error_with_context',
     'LogContext',
-    'log_performance',
+    'log_performance', 
+    "BookingValidationError",
+    "NoAvailabilityError",
+    "InvalidDateError",
+    "InvalidTimeError",
+    "PartySizeTooLargeError",
+    "AudioProcessingError",
+    "TranscriptionError",
+    "TextToSpeechError",
+    "LLMProviderError",
+    "DatabaseError",
+    "NotificationError",
+    "UserTimeoutError",
+    "AmbiguousInputError",
+    "InterruptionError",
+    
+    # Error messages
+    "get_error_message",
+    "get_alternative_suggestions",
+    "ErrorMessageGenerator",
+    
+    # Handlers
+    "handle_booking_error",
+    "handle_audio_error",
+    "handle_llm_error",
+    "handle_database_error",
+    "log_error_with_context",
+    "ErrorHandler", 
 ]

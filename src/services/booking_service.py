@@ -16,18 +16,28 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from models.database import Booking, TimeSlot, RestaurantConfig
 from models.schemas import BookingCreate, TimeSlotInfo
 
-# Import centralized error handling
-import sys
-sys.path.insert(0, '..')
-from error_handling.exceptions import (
-    BookingValidationError,
-    NoAvailabilityError,
-    InvalidDateError,
-    InvalidTimeError,
-    InvalidPartySizeError,
-    DatabaseError as DBError
-)
-from error_handling.handlers import with_retry, log_function_call
+# Import enhanced error handling
+try:
+    from error_handling.exceptions import (
+        BookingValidationError,
+        NoAvailabilityError,
+        InvalidDateError,
+        InvalidTimeError,
+        PartySizeTooLargeError,
+        DatabaseError as EnhancedDatabaseError,
+    )
+    from error_handling.handlers import log_error_with_context
+    ERROR_HANDLING_AVAILABLE = True
+except ImportError:
+    # Fallback to basic exceptions
+    ERROR_HANDLING_AVAILABLE = False
+    BookingValidationError = Exception
+    NoAvailabilityError = Exception
+    InvalidDateError = Exception
+    InvalidTimeError = Exception
+    PartySizeTooLargeError = Exception
+    EnhancedDatabaseError = Exception
+
 
 # Legacy exception aliases for backward compatibility
 BookingServiceError = BookingValidationError
@@ -213,7 +223,8 @@ class BookingService:
         self, 
         date: date, 
         time: time, 
-        party_size: int
+        party_size: int,
+        raise_enhanced_errors: bool = True
     ) -> Tuple[bool, str]:
         """
         Validate booking request against business rules.
@@ -222,66 +233,79 @@ class BookingService:
             date: Requested booking date
             time: Requested booking time
             party_size: Number of people in the party
+            raise_enhanced_errors: If True, raise enhanced exception types
             
         Returns:
             Tuple of (is_valid, error_message). If valid, error_message is empty.
+            
+        Raises:
+            InvalidDateError: If date is invalid (when raise_enhanced_errors=True)
+            InvalidTimeError: If time is invalid (when raise_enhanced_errors=True)
+            PartySizeTooLargeError: If party size exceeds max (when raise_enhanced_errors=True)
         """
         config = self._get_restaurant_config()
         today = datetime.now().date()
         
         # Check date is not in the past
         if date < today:
-            raise InvalidDateError(
-                message="Booking date cannot be in the past",
-                user_message="I'm sorry, but that date has already passed. We can only book reservations for today or future dates. What date would work for you?",
-                invalid_date=date,
-                reason="past"
-            )
+            if raise_enhanced_errors and ERROR_HANDLING_AVAILABLE:
+                raise InvalidDateError(
+                    "Booking date cannot be in the past",
+                    date=date,
+                    reason="past"
+                )
+            return False, "Booking date cannot be in the past"
         
         # Check date is not more than booking_window_days in the future
         max_date = today + timedelta(days=config.booking_window_days)
         if date > max_date:
-            raise InvalidDateError(
-                message=f"Bookings can only be made up to {config.booking_window_days} days in advance",
-                user_message=f"I'm sorry, but we can only take reservations up to {config.booking_window_days} days in advance. Could you choose a date within the next month?",
-                invalid_date=date,
-                reason="too_far"
-            )
+            if raise_enhanced_errors and ERROR_HANDLING_AVAILABLE:
+                raise InvalidDateError(
+                    f"Bookings can only be made up to {config.booking_window_days} days in advance",
+                    date=date,
+                    reason="too_far"
+                )
+            return False, f"Bookings can only be made up to {config.booking_window_days} days in advance"
         
         # Check party_size is within allowed range
         if party_size < 1:
-            raise InvalidPartySizeError(
-                message="Party size must be at least 1",
-                user_message="I need at least one person for the reservation. How many people will be dining?",
-                party_size=party_size
-            )
+            if raise_enhanced_errors and ERROR_HANDLING_AVAILABLE:
+                raise BookingValidationError(
+                    "Party size must be at least 1",
+                    field="party_size",
+                    value=party_size
+                )
+            return False, "Party size must be at least 1"
         
         if party_size > config.max_party_size:
-            raise InvalidPartySizeError(
-                message=f"Party size cannot exceed {config.max_party_size} people",
-                user_message=f"I'm sorry, but we can only accommodate parties of up to {config.max_party_size} people. For larger groups, please call us directly at the restaurant so we can make special arrangements.",
-                party_size=party_size,
-                max_party_size=config.max_party_size
-            )
+            if raise_enhanced_errors and ERROR_HANDLING_AVAILABLE:
+                raise PartySizeTooLargeError(
+                    f"Party size {party_size} exceeds maximum {config.max_party_size}",
+                    party_size=party_size,
+                    max_party_size=config.max_party_size
+                )
+            return False, f"Party size cannot exceed {config.max_party_size} people"
         
         # Check requested time is within operating hours for that day of week
         open_time, close_time = self._get_operating_hours(date)
         
         if open_time is None or close_time is None:
-            raise InvalidDateError(
-                message=f"Restaurant is closed on {date.strftime('%A')}s",
-                user_message=f"I'm sorry, but we're closed on {date.strftime('%A')}s. Would you like to book for a different day?",
-                invalid_date=date,
-                reason="closed"
-            )
+            if raise_enhanced_errors and ERROR_HANDLING_AVAILABLE:
+                raise InvalidDateError(
+                    f"Restaurant is closed on {date.strftime('%A')}s",
+                    date=date,
+                    reason="closed"
+                )
+            return False, f"Restaurant is closed on {date.strftime('%A')}s"
         
         if not (open_time <= time < close_time):
-            raise InvalidTimeError(
-                message=f"Requested time is outside operating hours ({open_time.strftime('%H:%M')} - {close_time.strftime('%H:%M')})",
-                user_message=f"I'm sorry, but we're only open from {open_time.strftime('%I:%M %p')} to {close_time.strftime('%I:%M %p')}. What time would work for you within our operating hours?",
-                invalid_time=time,
-                operating_hours={"open": open_time.strftime('%H:%M'), "close": close_time.strftime('%H:%M')}
-            )
+            if raise_enhanced_errors and ERROR_HANDLING_AVAILABLE:
+                raise InvalidTimeError(
+                    f"Requested time is outside operating hours",
+                    time=time,
+                    operating_hours=(open_time, close_time)
+                )
+            return False, f"Requested time is outside operating hours ({open_time.strftime('%H:%M')} - {close_time.strftime('%H:%M')})"
         
         return True, ""
     
@@ -341,25 +365,28 @@ class BookingService:
             if not time_slot.is_available(booking_data.party_size):
                 remaining = time_slot.remaining_capacity()
                 
-                # Try to find alternative time slots
-                alternatives = []
-                try:
-                    all_slots = self.get_available_slots(booking_data.date, booking_data.party_size)
-                    alternatives = [
-                        {"time": slot.time, "remaining": slot.remaining_capacity}
-                        for slot in all_slots[:3]  # Top 3 alternatives
-                    ]
-                except Exception:
-                    pass  # Don't fail if we can't get alternatives
-                
-                raise NoAvailabilityError(
-                    message=f"Insufficient capacity. Only {remaining} seats remaining for this time slot.",
-                    user_message=f"I'm sorry, but we only have {remaining} seats left at that time and you need {booking_data.party_size}.",
-                    requested_date=booking_data.date,
-                    requested_time=booking_data.time_slot,
-                    party_size=booking_data.party_size,
-                    alternatives=alternatives
-                )
+                # Raise enhanced error if available
+                if ERROR_HANDLING_AVAILABLE:
+                    # Try to get alternative slots
+                    try:
+                        alternatives = self.get_available_slots(
+                            booking_data.date,
+                            booking_data.party_size
+                        )
+                    except Exception:
+                        alternatives = []
+                    
+                    raise NoAvailabilityError(
+                        f"Insufficient capacity for {booking_data.party_size} people",
+                        date=booking_data.date,
+                        time=booking_data.time_slot,
+                        party_size=booking_data.party_size,
+                        available_alternatives=alternatives
+                    )
+                else:
+                    raise CapacityError(
+                        f"Insufficient capacity. Only {remaining} seats remaining for this time slot."
+                    )
             
             # Create booking
             booking = Booking(
