@@ -446,3 +446,100 @@ def llm_chat(
             provider=provider,
             original_error=e,
         )
+
+
+def llm_chat_with_fallback(
+    primary_provider: str,
+    messages: List[Dict[str, str]],
+    system_prompt: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 500,
+    fallback_providers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Call LLM with automatic failover to alternative providers.
+    
+    Tries providers in order until one succeeds:
+    1. Primary provider
+    2. Fallback providers (if specified)
+    3. Default fallback order: openai -> gemini -> claude
+    
+    Args:
+        primary_provider: Primary LLM provider to try first
+        messages: List of chat messages
+        system_prompt: Optional system prompt
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens to generate
+        fallback_providers: List of fallback providers to try (in order)
+    
+    Returns:
+        Dictionary with response content, provider used, and token count
+    
+    Raises:
+        LLMError: If all providers fail
+    
+    Example:
+        >>> response = llm_chat_with_fallback(
+        ...     primary_provider="openai",
+        ...     messages=[{"role": "user", "content": "Hello!"}],
+        ...     fallback_providers=["gemini", "claude"]
+        ... )
+        >>> print(f"Used provider: {response['provider']}")
+    """
+    # Determine fallback order
+    if fallback_providers is None:
+        # Default fallback order based on primary
+        all_providers = ["openai", "gemini", "claude"]
+        fallback_providers = [p for p in all_providers if p != primary_provider]
+    
+    # Create ordered list of providers to try
+    providers_to_try = [primary_provider] + fallback_providers
+    
+    errors = {}
+    
+    for provider in providers_to_try:
+        try:
+            logger.info(f"Attempting LLM call with provider: {provider}")
+            response = llm_chat(
+                provider=provider,
+                messages=messages,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            
+            # Success! Log if we used a fallback
+            if provider != primary_provider:
+                logger.info(
+                    f"Primary provider {primary_provider} failed, "
+                    f"successfully used fallback provider: {provider}"
+                )
+            
+            return response
+            
+        except LLMError as e:
+            errors[provider] = str(e)
+            logger.warning(
+                f"Provider {provider} failed: {str(e)} | "
+                f"Trying next provider if available"
+            )
+            continue
+        except ValueError as e:
+            # Configuration error (invalid provider, missing API key)
+            errors[provider] = str(e)
+            logger.warning(f"Provider {provider} configuration error: {str(e)}")
+            continue
+        except Exception as e:
+            errors[provider] = str(e)
+            logger.error(f"Unexpected error with provider {provider}: {str(e)}")
+            continue
+    
+    # All providers failed
+    error_summary = ", ".join([f"{p}: {e}" for p, e in errors.items()])
+    logger.error(f"All LLM providers failed. Errors: {error_summary}")
+    
+    raise LLMError(
+        f"All LLM providers failed. Tried: {', '.join(providers_to_try)}. "
+        f"Errors: {error_summary}",
+        provider="all",
+    )
