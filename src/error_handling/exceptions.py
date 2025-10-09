@@ -1,21 +1,34 @@
+""" 
+Custom exception classes for restaurant booking system error handling.
+
+This module defines a comprehensive hierarchy of exceptions for different
+error categories that can occur during the booking conversation flow.
 """
-Custom Exception Classes for Restaurant Booking Voice Agent.
+from typing import Optional, Dict, Any, List
+ 
+Custom exception classes for restaurant booking voice agent.
 
-This module defines exception classes for different error categories:
-- Business Logic Errors (booking validation)
-- Technical Errors (STT/TTS, LLM, database)
-- User Interaction Errors (timeouts, ambiguous input)
+This module defines exception hierarchies for different error categories:
+- Business logic errors (booking validation, availability, etc.)
+- Technical errors (audio, STT/TTS, LLM, database)
+- User interaction errors (timeout, ambiguity, interruptions)
 
-Each exception includes context for error recovery and logging.
-"""
-
-from typing import Optional, Any, Dict
-from datetime import date, time
-
-
+All exceptions include context information for better error handling and logging.
+""" 
 class BookingSystemError(Exception):
-    """Base exception for all booking system errors."""
+    """
+    Base exception for all booking system errors.
     
+    Attributes:
+        message: Human-readable error message
+        user_message: Natural language message suitable for voice output
+        context: Additional context information for debugging
+        recoverable: Whether the error is recoverable
+    """
+ 
+class BookingAgentError(Exception):
+    """Base exception for all booking agent errors."""
+     
     def __init__(
         self,
         message: str,
@@ -23,598 +36,522 @@ class BookingSystemError(Exception):
         context: Optional[Dict[str, Any]] = None,
         recoverable: bool = True
     ):
-        """
-        Initialize booking system error.
+         """
+        Initialize booking agent error.
         
         Args:
             message: Technical error message for logging
-            user_message: User-friendly message for voice response
-            context: Additional context for error recovery
-            recoverable: Whether the error is recoverable
+            user_message: User-friendly message for voice output (if None, uses message)
+            context: Additional context information
+            recoverable: Whether the error is recoverable (conversation can continue)
         """
         super().__init__(message)
         self.message = message
         self.user_message = user_message or message
         self.context = context or {}
         self.recoverable = recoverable
-
-
+ 
+ 
 # ============================================================================
 # Business Logic Errors
 # ============================================================================
 
 class BookingValidationError(BookingSystemError):
     """
-    Raised when booking validation fails.
+    Exception for booking validation failures.
     
-    Examples:
-    - Invalid dates (past dates, beyond booking window)
+    Raised when booking request violates business rules such as:
+    - Past dates
+    - Dates beyond booking window
     - Party size exceeds maximum
-    - Invalid time slot (outside operating hours)
-    - No availability for requested date/time/party_size
+    - Invalid time slots 
+class BookingValidationError(BookingAgentError):
+    """
+    Exception raised when booking validation fails.
+    
+    This includes general validation errors for bookings that don't fit
+    other specific categories. 
     """
     
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
-        field: Optional[str] = None,
-        value: Optional[Any] = None,
-        alternatives: Optional[list] = None,
-        **kwargs
+        validation_field: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
     ):
-        """
-        Initialize booking validation error.
-        
-        Args:
-            message: Technical error message
-            user_message: User-friendly message
-            field: Field that failed validation (date, time, party_size)
-            value: Invalid value
-            alternatives: List of alternative valid options
-            **kwargs: Additional context
-        """
-        context = {
-            "field": field,
-            "value": value,
-            "alternatives": alternatives or [],
-            **kwargs
-        }
-        super().__init__(message, user_message, context, recoverable=True)
-        self.field = field
-        self.value = value
-        self.alternatives = alternatives or []
-
-
-class NoAvailabilityError(BookingValidationError):
-    """Raised when no availability exists for the requested slot."""
-    
-    def __init__(
-        self,
-        date: date,
-        time: Optional[time] = None,
-        party_size: Optional[int] = None,
-        alternative_slots: Optional[list] = None,
-        **kwargs
-    ):
-        """
-        Initialize no availability error.
-        
-        Args:
-            date: Requested date
-            time: Requested time (if specified)
-            party_size: Requested party size
-            alternative_slots: List of alternative available slots
-            **kwargs: Additional context
-        """
-        message = f"No availability for date={date}, time={time}, party_size={party_size}"
-        context = {
-            "date": date,
-            "time": time,
-            "party_size": party_size,
-            "alternative_slots": alternative_slots or [],
-            **kwargs
-        }
+        self.validation_field = validation_field
         super().__init__(
             message=message,
-            field="availability",
-            alternatives=alternative_slots,
-            **context
+            user_message=user_message,
+            context=context,
+            recoverable=True
+        )
+
+
+class NoAvailabilityError(BookingSystemError):
+    """
+    Exception when no availability exists for requested date/time/party_size.
+    
+    Should include alternative time slots when possible.
+    """ 
+        field: Optional[str] = None,
+        value: Any = None,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "field": field,
+            "value": value,
+            "error_type": "validation"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.field = field
+        self.value = value
+
+
+class NoAvailabilityError(BookingAgentError):
+    """Exception raised when no availability exists for the requested date/time/party_size."""
+   
+    def __init__(
+        self,
+        message: str,
+        user_message: Optional[str] = None,
+         requested_date: Optional[date] = None,
+        requested_time: Optional[time] = None,
+        party_size: Optional[int] = None,
+        alternatives: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.requested_date = requested_date
+        self.requested_time = requested_time
+        self.party_size = party_size
+        self.alternatives = alternatives or []
+        
+        ctx = context or {}
+        ctx.update({
+            "requested_date": str(requested_date) if requested_date else None,
+            "requested_time": str(requested_time) if requested_time else None,
+            "party_size": party_size,
+            "alternatives_count": len(self.alternatives)
+        })
+        
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            context=ctx,
+            recoverable=True
         )
 
 
 class InvalidDateError(BookingValidationError):
-    """Raised when date is invalid (past date or beyond booking window)."""
-    
-    def __init__(self, date: date, reason: str, **kwargs):
-        message = f"Invalid date {date}: {reason}"
+    """Exception for invalid dates (past dates, beyond booking window)."""
+ 
+        date: Optional[date] = None,
+        time: Optional[time] = None,
+        party_size: Optional[int] = None,
+        available_alternatives: Optional[list] = None,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "date": str(date) if date else None,
+            "time": str(time) if time else None,
+            "party_size": party_size,
+            "available_alternatives": available_alternatives,
+            "error_type": "no_availability"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.date = date
+        self.time = time
+        self.party_size = party_size
+        self.available_alternatives = available_alternatives or []
+
+
+class InvalidDateError(BookingAgentError):
+    """Exception raised when date is invalid (past date or beyond booking window)."""
+     
+    def __init__(
+        self,
+        message: str,
+        user_message: Optional[str] = None,
+        invalid_date: Optional[date] = None,
+        reason: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.invalid_date = invalid_date
+        self.reason = reason
+        
+        ctx = context or {}
+        ctx.update({
+            "invalid_date": str(invalid_date) if invalid_date else None,
+            "reason": reason
+        })
+        
         super().__init__(
             message=message,
-            field="date",
-            value=date,
-            **kwargs
+            user_message=user_message,
+            validation_field="date",
+            context=ctx
         )
 
 
 class InvalidTimeError(BookingValidationError):
-    """Raised when time is outside operating hours."""
-    
-    def __init__(
-        self,
-        time: time,
-        operating_hours: Optional[tuple] = None,
+    """Exception for invalid time slots (outside operating hours)."""
+        date: Optional[date] = None,
+        reason: Optional[str] = None,
         **kwargs
     ):
-        message = f"Invalid time {time}"
-        if operating_hours:
-            message += f". Operating hours: {operating_hours[0]} - {operating_hours[1]}"
+        context = kwargs.pop("context", {})
+        context.update({
+            "date": str(date) if date else None,
+            "reason": reason,
+            "error_type": "invalid_date"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.date = date
+        self.reason = reason
+
+
+class InvalidTimeError(BookingAgentError):
+    """Exception raised when time is outside operating hours."""
+     
+    def __init__(
+        self,
+        message: str,
+        user_message: Optional[str] = None,
+        invalid_time: Optional[time] = None,
+        operating_hours: Optional[Dict[str, str]] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.invalid_time = invalid_time
+        self.operating_hours = operating_hours
+        
+        ctx = context or {}
+        ctx.update({
+            "invalid_time": str(invalid_time) if invalid_time else None,
+            "operating_hours": operating_hours
+        })
+        
         super().__init__(
             message=message,
-            field="time",
-            value=time,
-            operating_hours=operating_hours,
-            **kwargs
+            user_message=user_message,
+            validation_field="time",
+            context=ctx
         )
 
 
 class InvalidPartySizeError(BookingValidationError):
-    """Raised when party size is invalid or exceeds maximum."""
-    
-    def __init__(self, party_size: int, max_size: int = 8, **kwargs):
-        message = f"Invalid party size {party_size}. Maximum is {max_size}."
+    """Exception when party size exceeds maximum or is invalid."""
+         time: Optional[time] = None,
+        operating_hours: Optional[tuple] = None,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "time": str(time) if time else None,
+            "operating_hours": operating_hours,
+            "error_type": "invalid_time"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.time = time
+        self.operating_hours = operating_hours
+
+
+class PartySizeTooLargeError(BookingAgentError):
+    """Exception raised when party size exceeds maximum allowed."""
+     
+    def __init__(
+        self,
+        message: str,
+        user_message: Optional[str] = None,
+        party_size: Optional[int] = None,
+        max_party_size: Optional[int] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.party_size = party_size
+        self.max_party_size = max_party_size
+        
+        ctx = context or {}
+        ctx.update({
+            "party_size": party_size,
+            "max_party_size": max_party_size
+        })
+        
         super().__init__(
             message=message,
-            field="party_size",
-            value=party_size,
-            max_size=max_size,
-            **kwargs
-        )
-
+            user_message=user_message,
+            validation_field="party_size",
+            context=ctx
+        ) 
+        max_party_size: int = 8,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "party_size": party_size,
+            "max_party_size": max_party_size,
+            "error_type": "party_too_large"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.party_size = party_size
+        self.max_party_size = max_party_size
+ 
 
 # ============================================================================
 # Technical Errors - Audio Processing
 # ============================================================================
-
-class AudioProcessingError(BookingSystemError):
-    """
-    Raised when audio processing fails.
-    
-    Examples:
-    - Microphone not accessible
-    - Recording failure
-    - Playback failure
-    - Audio device errors
-    """
-    
+ 
+class AudioProcessingError(BookingAgentError):
+    """Base exception for audio processing errors."""
+     
     def __init__(
         self,
         message: str,
-        error_type: str = "unknown",
-        original_error: Optional[Exception] = None,
-        **kwargs
+        user_message: Optional[str] = None,
+        audio_type: Optional[str] = None,  # "recording", "playback", "processing"
+        context: Optional[Dict[str, Any]] = None,
+        recoverable: bool = True
     ):
-        """
-        Initialize audio processing error.
+        self.audio_type = audio_type
+        ctx = context or {}
+        ctx["audio_type"] = audio_type
         
-        Args:
-            message: Error message
-            error_type: Type of audio error (device, recording, playback)
-            original_error: Original exception if any
-            **kwargs: Additional context
-        """
-        context = {
-            "error_type": error_type,
-            "original_error": str(original_error) if original_error else None,
-            **kwargs
-        }
-        super().__init__(message, context=context, recoverable=True)
-        self.error_type = error_type
-        self.original_error = original_error
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            context=ctx,
+            recoverable=recoverable
+        )
 
 
 class STTError(AudioProcessingError):
-    """
-    Raised when Speech-to-Text fails.
-    
-    Examples:
-    - Unclear audio
-    - Failed transcription
-    - Whisper API errors
-    """
-    
+    """Exception for Speech-to-Text (Whisper) failures."""
+        audio_type: Optional[str] = None,  # "recording", "playback", "device"
+        original_error: Optional[Exception] = None,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "audio_type": audio_type,
+            "original_error": str(original_error) if original_error else None,
+            "error_type": "audio_processing"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.audio_type = audio_type
+        self.original_error = original_error
+
+
+class TranscriptionError(AudioProcessingError):
+    """Exception raised when speech-to-text transcription fails."""
+  
     def __init__(
         self,
         message: str,
-        audio_quality: Optional[str] = None,
-        **kwargs
+        user_message: Optional[str] = None,
+        provider: Optional[str] = None,
+        original_error: Optional[Exception] = None,
+        context: Optional[Dict[str, Any]] = None
     ):
+        self.provider = provider
+        self.original_error = original_error
+        
+        ctx = context or {}
+        ctx.update({
+            "provider": provider,
+            "original_error": str(original_error) if original_error else None
+        })
+        
         super().__init__(
             message=message,
-            error_type="stt",
-            audio_quality=audio_quality,
-            **kwargs
+            user_message=user_message,
+            audio_type="stt",
+            context=ctx,
+            recoverable=True
         )
 
 
 class TTSError(AudioProcessingError):
-    """
-    Raised when Text-to-Speech fails.
-    
-    Examples:
-    - ElevenLabs API failure
-    - Rate limit exceeded
-    - Audio generation error
-    """
+    """Exception for Text-to-Speech failures."""
     
     def __init__(
         self,
         message: str,
-        provider: str = "elevenlabs",
+        user_message: Optional[str] = None,
+        provider: Optional[str] = None,  # "elevenlabs", "pyttsx3", "gtts"
+        can_fallback: bool = True,
         **kwargs
     ):
-        super().__init__(
-            message=message,
-            error_type="tts",
-            provider=provider,
-            **kwargs
-        )
-
-
-# ============================================================================
-# Technical Errors - LLM Provider
-# ============================================================================
-
-class LLMProviderError(BookingSystemError):
-    """
-    Raised when LLM provider fails.
-    
-    Examples:
-    - OpenAI, Gemini, Claude timeouts
-    - Rate limits
-    - Authentication errors
-    - API connection failures
-    """
-    
-    def __init__(
-        self,
-        message: str,
-        provider: str,
-        error_type: str = "unknown",
-        original_error: Optional[Exception] = None,
-        retry_possible: bool = True,
-        **kwargs
-    ):
-        """
-        Initialize LLM provider error.
-        
-        Args:
-            message: Error message
-            provider: LLM provider name (openai, gemini, claude)
-            error_type: Type of error (timeout, rate_limit, auth, connection)
-            original_error: Original exception
-            retry_possible: Whether retry is possible
-            **kwargs: Additional context
-        """
-        context = {
+        context = kwargs.pop("context", {})
+        context.update({
             "provider": provider,
-            "error_type": error_type,
-            "original_error": str(original_error) if original_error else None,
-            "retry_possible": retry_possible,
-            **kwargs
-        }
-        super().__init__(message, context=context, recoverable=retry_possible)
+            "can_fallback": can_fallback,
+            "error_type": "tts"
+        })
+        kwargs["audio_type"] = "tts"
+        super().__init__(message, user_message, **kwargs, context=context)
         self.provider = provider
-        self.error_type = error_type
+        self.can_fallback = can_fallback
+
+
+# ============================================================================
+# Technical Errors - LLM
+# ============================================================================
+
+class LLMProviderError(BookingAgentError):
+    """Exception raised when LLM provider fails."""
+    
+    def __init__(
+        self,
+        message: str,
+        user_message: Optional[str] = None,
+        provider: Optional[str] = None,  # "openai", "gemini", "claude"
+        error_type: Optional[str] = None,  # "rate_limit", "timeout", "auth", "api_error"
+        can_retry: bool = True,
+        can_fallback: bool = True,
+        original_error: Optional[Exception] = None,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "provider": provider,
+            "llm_error_type": error_type,
+            "can_retry": can_retry,
+            "can_fallback": can_fallback,
+            "original_error": str(original_error) if original_error else None,
+            "error_type": "llm_provider"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.provider = provider
+        self.llm_error_type = error_type
+        self.can_retry = can_retry
+        self.can_fallback = can_fallback
         self.original_error = original_error
-        self.retry_possible = retry_possible
-
-
-class LLMTimeoutError(LLMProviderError):
-    """Raised when LLM provider times out."""
-    
-    def __init__(self, provider: str, **kwargs):
-        super().__init__(
-            message=f"{provider} API timeout",
-            provider=provider,
-            error_type="timeout",
-            retry_possible=True,
-            **kwargs
-        )
-
-
-class LLMRateLimitError(LLMProviderError):
-    """Raised when LLM provider rate limit is exceeded."""
-    
-    def __init__(self, provider: str, **kwargs):
-        super().__init__(
-            message=f"{provider} rate limit exceeded",
-            provider=provider,
-            error_type="rate_limit",
-            retry_possible=True,
-            **kwargs
-        )
-
-
-class LLMAuthenticationError(LLMProviderError):
-    """Raised when LLM provider authentication fails."""
-    
-    def __init__(self, provider: str, **kwargs):
-        super().__init__(
-            message=f"{provider} authentication failed",
-            provider=provider,
-            error_type="authentication",
-            retry_possible=False,
-            **kwargs
-        )
 
 
 # ============================================================================
 # Technical Errors - Database
 # ============================================================================
 
-class DatabaseError(BookingSystemError):
-    """
-    Raised when database operations fail.
-    
-    Examples:
-    - Connection errors
-    - Query failures
-    - Transaction errors
-    - Constraint violations
-    """
+class DatabaseError(BookingAgentError):
+    """Exception raised when database operations fail."""
     
     def __init__(
         self,
         message: str,
-        error_type: str = "unknown",
+        user_message: Optional[str] = None,
+        operation: Optional[str] = None,  # "query", "insert", "update", "connection"
+        can_retry: bool = True,
         original_error: Optional[Exception] = None,
-        retry_possible: bool = True,
         **kwargs
     ):
-        """
-        Initialize database error.
-        
-        Args:
-            message: Error message
-            error_type: Type of error (connection, query, constraint)
-            original_error: Original exception
-            retry_possible: Whether retry is possible
-            **kwargs: Additional context
-        """
-        context = {
-            "error_type": error_type,
+        context = kwargs.pop("context", {})
+        context.update({
+            "operation": operation,
+            "can_retry": can_retry,
             "original_error": str(original_error) if original_error else None,
-            "retry_possible": retry_possible,
-            **kwargs
-        }
-        super().__init__(message, context=context, recoverable=retry_possible)
-        self.error_type = error_type
+            "error_type": "database"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.operation = operation
+        self.can_retry = can_retry
         self.original_error = original_error
-        self.retry_possible = retry_possible
-
-
-class DatabaseConnectionError(DatabaseError):
-    """Raised when database connection fails."""
-    
-    def __init__(self, message: str = "Database connection failed", **kwargs):
-        super().__init__(
-            message=message,
-            error_type="connection",
-            retry_possible=True,
-            **kwargs
-        )
-
-
-class DatabaseQueryError(DatabaseError):
-    """Raised when database query fails."""
-    
-    def __init__(self, message: str, **kwargs):
-        super().__init__(
-            message=message,
-            error_type="query",
-            retry_possible=True,
-            **kwargs
-        )
 
 
 # ============================================================================
 # Technical Errors - Notifications
 # ============================================================================
 
-class NotificationError(BookingSystemError):
-    """
-    Raised when notification delivery fails.
-    
-    Examples:
-    - SMS delivery failure (Twilio)
-    - Email delivery failure (SendGrid)
-    """
+class NotificationError(BookingAgentError):
+    """Exception raised when SMS/email notifications fail."""
     
     def __init__(
         self,
         message: str,
-        notification_type: str,
-        recipient: Optional[str] = None,
-        original_error: Optional[Exception] = None,
+        user_message: Optional[str] = None,
+        notification_type: Optional[str] = None,  # "sms", "email"
+        provider: Optional[str] = None,  # "twilio", "sendgrid"
+        blocking: bool = False,  # Whether this should block the booking flow
         **kwargs
     ):
-        """
-        Initialize notification error.
-        
-        Args:
-            message: Error message
-            notification_type: Type of notification (sms, email)
-            recipient: Recipient address/phone
-            original_error: Original exception
-            **kwargs: Additional context
-        """
-        context = {
+        context = kwargs.pop("context", {})
+        context.update({
             "notification_type": notification_type,
-            "recipient": recipient,
-            "original_error": str(original_error) if original_error else None,
-            **kwargs
-        }
-        # Notifications are non-critical - booking should continue
-        super().__init__(message, context=context, recoverable=True)
+            "provider": provider,
+            "blocking": blocking,
+            "error_type": "notification"
+        })
+        super().__init__(message, user_message, context, recoverable=True, **kwargs)
         self.notification_type = notification_type
-        self.recipient = recipient
-        self.original_error = original_error
-
-
-class SMSDeliveryError(NotificationError):
-    """Raised when SMS delivery fails."""
-    
-    def __init__(self, phone: str, **kwargs):
-        super().__init__(
-            message=f"Failed to send SMS to {phone}",
-            notification_type="sms",
-            recipient=phone,
-            **kwargs
-        )
-
-
-class EmailDeliveryError(NotificationError):
-    """Raised when email delivery fails."""
-    
-    def __init__(self, email: str, **kwargs):
-        super().__init__(
-            message=f"Failed to send email to {email}",
-            notification_type="email",
-            recipient=email,
-            **kwargs
-        )
+        self.provider = provider
+        self.blocking = blocking
 
 
 # ============================================================================
 # User Interaction Errors
 # ============================================================================
 
-class UserTimeoutError(BookingSystemError):
-    """
-    Raised when user doesn't respond within timeout period.
-    
-    Examples:
-    - No response after prompt
-    - Extended silence during conversation
-    """
-    
-    def __init__(
-        self,
-        timeout_seconds: int,
-        prompt: Optional[str] = None,
-        retry_count: int = 0,
-        **kwargs
-    ):
-        """
-        Initialize user timeout error.
-        
-        Args:
-            timeout_seconds: Timeout duration in seconds
-            prompt: Last prompt that timed out
-            retry_count: Number of retry attempts made
-            **kwargs: Additional context
-        """
-        message = f"User timeout after {timeout_seconds} seconds"
-        context = {
-            "timeout_seconds": timeout_seconds,
-            "prompt": prompt,
-            "retry_count": retry_count,
-            **kwargs
-        }
-        super().__init__(message, context=context, recoverable=True)
-        self.timeout_seconds = timeout_seconds
-        self.prompt = prompt
-        self.retry_count = retry_count
-
-
-class AmbiguousInputError(BookingSystemError):
-    """Raised when user input is ambiguous or incomplete."""
-    
-    def __init__(
-        self,
-        user_input: str,
-        missing_fields: Optional[list] = None,
-        **kwargs
-    ):
-        """
-        Initialize ambiguous input error.
-        
-        Args:
-            user_input: User's unclear input
-            missing_fields: Fields that couldn't be extracted
-            **kwargs: Additional context
-        """
-        message = f"Ambiguous input: {user_input}"
-        context = {
-            "user_input": user_input,
-            "missing_fields": missing_fields or [],
-            **kwargs
-        }
-        super().__init__(message, context=context, recoverable=True)
-        self.user_input = user_input
-        self.missing_fields = missing_fields or []
-
-
-class UserCorrectionError(BookingSystemError):
-    """Raised when user wants to correct previously provided information."""
-    
-    def __init__(
-        self,
-        field: str,
-        old_value: Any,
-        new_value: Any,
-        **kwargs
-    ):
-        """
-        Initialize user correction error.
-        
-        Args:
-            field: Field being corrected
-            old_value: Previous value
-            new_value: New value
-            **kwargs: Additional context
-        """
-        message = f"User correction: {field} from {old_value} to {new_value}"
-        context = {
-            "field": field,
-            "old_value": old_value,
-            "new_value": new_value,
-            **kwargs
-        }
-        super().__init__(message, context=context, recoverable=True)
-        self.field = field
-        self.old_value = old_value
-        self.new_value = new_value
-
-
-# ============================================================================
-# System Errors
-# ============================================================================
-
-class SystemError(BookingSystemError):
-    """
-    Raised for general system errors.
-    
-    Used for unexpected errors that don't fit other categories.
-    """
+class UserTimeoutError(BookingAgentError):
+    """Exception raised when user doesn't respond within timeout period."""
     
     def __init__(
         self,
         message: str,
-        original_error: Optional[Exception] = None,
+        user_message: Optional[str] = None,
+        timeout_seconds: Optional[int] = None,
+        retry_count: int = 0,
+        max_retries: int = 2,
         **kwargs
     ):
-        """
-        Initialize system error.
-        
-        Args:
-            message: Error message
-            original_error: Original exception
-            **kwargs: Additional context
-        """
-        context = {
-            "original_error": str(original_error) if original_error else None,
-            **kwargs
-        }
-        super().__init__(message, context=context, recoverable=False)
-        self.original_error = original_error
+        context = kwargs.pop("context", {})
+        context.update({
+            "timeout_seconds": timeout_seconds,
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "error_type": "user_timeout"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.timeout_seconds = timeout_seconds
+        self.retry_count = retry_count
+        self.max_retries = max_retries
+
+
+class AmbiguousInputError(BookingAgentError):
+    """Exception raised when user input is ambiguous or incomplete."""
+    
+    def __init__(
+        self,
+        message: str,
+        user_message: Optional[str] = None,
+        field: Optional[str] = None,
+        possible_interpretations: Optional[list] = None,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "field": field,
+            "possible_interpretations": possible_interpretations,
+            "error_type": "ambiguous_input"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.field = field
+        self.possible_interpretations = possible_interpretations or []
+
+
+class InterruptionError(BookingAgentError):
+    """Exception raised when user speaks while agent is speaking."""
+    
+    def __init__(
+        self,
+        message: str,
+        user_message: Optional[str] = None,
+        agent_was_saying: Optional[str] = None,
+        **kwargs
+    ):
+        context = kwargs.pop("context", {})
+        context.update({
+            "agent_was_saying": agent_was_saying,
+            "error_type": "interruption"
+        })
+        super().__init__(message, user_message, context, **kwargs)
+        self.agent_was_saying = agent_was_saying

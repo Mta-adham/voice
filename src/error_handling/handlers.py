@@ -1,375 +1,487 @@
 """
-Centralized Error Handling Utilities.
+Centralized error handling utilities for the booking voice agent.
 
-This module provides handler functions for different error types,
-implementing logging, error recovery, and graceful degradation strategies.
+This module provides:
+- Error handler class for consistent error processing
+- Logging with context information
+- Recovery strategies and retry logic
+- Integration helpers for different system components
 """
 
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, TypeVar
+from datetime import datetime
 from loguru import logger
+import traceback
+import sys
 
 from .exceptions import (
-    BookingSystemError,
+    BookingAgentError,
     BookingValidationError,
+    NoAvailabilityError,
+    InvalidDateError,
+    InvalidTimeError,
+    PartySizeTooLargeError,
     AudioProcessingError,
+    TranscriptionError,
+    TextToSpeechError,
     LLMProviderError,
     DatabaseError,
     NotificationError,
     UserTimeoutError,
+    AmbiguousInputError,
+    InterruptionError,
 )
 from .error_messages import get_error_message
 
 
+T = TypeVar('T')
+
+
 class ErrorHandler:
     """
-    Centralized error handler for the booking system.
+    Centralized error handler for the booking voice agent.
     
-    Provides consistent error logging, recovery strategies,
-    and user message generation.
+    This class provides consistent error handling across all components:
+    - Logs errors with context
+    - Generates user-friendly messages
+    - Determines if errors are recoverable
+    - Provides retry and fallback strategies
     """
     
-    @staticmethod
-    def handle_error(
-        error: Exception,
-        context: Optional[Dict[str, Any]] = None,
-        log_level: str = "error",
-    ) -> Dict[str, Any]:
+    def __init__(
+        self,
+        log_errors: bool = True,
+        generate_messages: bool = True,
+        user_id: Optional[str] = None
+    ):
         """
-        Handle any error with logging and message generation.
+        Initialize error handler.
         
         Args:
-            error: Exception that occurred
-            context: Additional context for logging
-            log_level: Log level (error, warning, info)
-        
-        Returns:
-            Dictionary with error handling results:
-            - error_type: Type of error
-            - user_message: Message to speak to user
-            - recoverable: Whether error is recoverable
-            - context: Error context
+            log_errors: Whether to log errors
+            generate_messages: Whether to generate user-friendly messages
+            user_id: Optional user identifier for context
         """
-        error_info = {
-            "error_type": type(error).__name__,
-            "error_message": str(error),
-            "recoverable": True,
-            "user_message": "",
-            "context": context or {},
-        }
+        self.log_errors = log_errors
+        self.generate_messages = generate_messages
+        self.user_id = user_id
+    
+    def handle_error(
+        self,
+        error: Exception,
+        context: Optional[Dict[str, Any]] = None,
+        log_level: str = "ERROR"
+    ) -> Dict[str, Any]:
+        """
+        Handle an error with logging and message generation.
         
-        # Extract additional info from BookingSystemError
-        if isinstance(error, BookingSystemError):
-            error_info["recoverable"] = error.recoverable
-            error_info["context"].update(error.context)
+        Args:
+            error: Exception to handle
+            context: Additional context information
+            log_level: Logging level (ERROR, WARNING, INFO)
+            
+        Returns:
+            Dictionary with:
+                - error_type: Type of error
+                - user_message: Message to speak to user
+                - technical_message: Technical error details
+                - recoverable: Whether error is recoverable
+                - context: Error context
+                - should_retry: Whether operation should be retried
+        """
+        context = context or {}
+        
+        # Add timestamp and user_id to context
+        context.update({
+            "timestamp": datetime.utcnow().isoformat(),
+            "user_id": self.user_id,
+        })
+        
+        # Extract error information
+        error_type = type(error).__name__
+        technical_message = str(error)
+        
+        # Check if it's a BookingAgentError with additional context
+        if isinstance(error, BookingAgentError):
+            context.update(error.context)
+            recoverable = error.recoverable
+        else:
+            recoverable = True  # Assume recoverable unless specified
         
         # Generate user-friendly message
-        error_info["user_message"] = get_error_message(error)
+        if self.generate_messages:
+            user_message = get_error_message(error)
+        else:
+            user_message = technical_message
         
         # Log the error
-        log_msg = f"Error handled: {error_info['error_type']} - {error_info['error_message']}"
-        if error_info["context"]:
-            log_msg += f" | Context: {error_info['context']}"
+        if self.log_errors:
+            log_error_with_context(
+                error=error,
+                context=context,
+                level=log_level
+            )
         
-        if log_level == "error":
-            logger.error(log_msg)
-        elif log_level == "warning":
-            logger.warning(log_msg)
-        else:
-            logger.info(log_msg)
+        # Determine retry strategy
+        should_retry = self._should_retry(error)
         
-        return error_info
+        return {
+            "error_type": error_type,
+            "user_message": user_message,
+            "technical_message": technical_message,
+            "recoverable": recoverable,
+            "context": context,
+            "should_retry": should_retry,
+        }
+    
+    def _should_retry(self, error: Exception) -> bool:
+        """Determine if operation should be retried based on error type."""
+        # Retriable errors
+        if isinstance(error, (DatabaseError, LLMProviderError)):
+            if isinstance(error, DatabaseError) and error.can_retry:
+                return True
+            if isinstance(error, LLMProviderError) and error.can_retry:
+                return True
+        
+        # Non-retriable errors
+        if isinstance(error, (
+            BookingValidationError,
+            InvalidDateError,
+            InvalidTimeError,
+            PartySizeTooLargeError,
+            NoAvailabilityError,
+        )):
+            return False
+        
+        # Default to not retrying
+        return False
+    
+    def wrap_function(
+        self,
+        func: Callable[..., T],
+        error_context: Optional[Dict[str, Any]] = None,
+        on_error: Optional[Callable[[Exception], Any]] = None
+    ) -> Callable[..., T]:
+        """
+        Wrap a function with error handling.
+        
+        Args:
+            func: Function to wrap
+            error_context: Context to include in error logs
+            on_error: Optional callback to call on error
+            
+        Returns:
+            Wrapped function with error handling
+        """
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Handle the error
+                result = self.handle_error(e, error_context)
+                
+                # Call error callback if provided
+                if on_error:
+                    on_error(e)
+                
+                # Re-raise if not recoverable
+                if not result["recoverable"]:
+                    raise
+                
+                return None
+        
+        return wrapper
 
+
+# ============================================================================
+# Specialized Error Handlers
+# ============================================================================
 
 def handle_booking_error(
-    error: BookingValidationError,
-    user_id: Optional[str] = None,
-    conversation_state: Optional[str] = None,
+    error: Exception,
+    booking_context: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Handle booking validation errors.
+    Handle booking-related errors.
     
     Args:
-        error: BookingValidationError instance
-        user_id: User identifier for logging
-        conversation_state: Current conversation state
-    
+        error: Booking error
+        booking_context: Context about the booking attempt
+        
     Returns:
-        Error handling result with user message and alternatives
+        Error handling result dictionary
     """
-    context = {
-        "user_id": user_id,
-        "conversation_state": conversation_state,
-        "field": error.field,
-        "value": error.value,
-        "alternatives": error.alternatives,
-    }
+    context = booking_context or {}
+    context["component"] = "booking_service"
     
-    logger.warning(
-        f"Booking validation failed | "
-        f"user_id={user_id} | "
-        f"field={error.field} | "
-        f"value={error.value} | "
-        f"reason={error.message}"
-    )
-    
-    return ErrorHandler.handle_error(error, context, log_level="warning")
+    handler = ErrorHandler()
+    return handler.handle_error(error, context)
 
 
 def handle_audio_error(
-    error: AudioProcessingError,
-    audio_type: Optional[str] = None,
+    error: Exception,
+    audio_context: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Handle audio processing errors.
     
     Args:
-        error: AudioProcessingError instance
-        audio_type: Type of audio operation (recording, playback, stt, tts)
-    
+        error: Audio error
+        audio_context: Context about the audio operation
+        
     Returns:
-        Error handling result with user message
+        Error handling result dictionary
     """
-    context = {
-        "audio_type": audio_type,
-        "error_type": error.error_type,
-    }
+    context = audio_context or {}
+    context["component"] = "audio_manager"
     
-    logger.error(
-        f"Audio processing error | "
-        f"type={error.error_type} | "
-        f"message={error.message}"
-    )
-    
-    return ErrorHandler.handle_error(error, context)
+    handler = ErrorHandler()
+    return handler.handle_error(error, context)
 
 
 def handle_llm_error(
-    error: LLMProviderError,
-    fallback_providers: Optional[list] = None,
+    error: Exception,
+    llm_context: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Handle LLM provider errors with fallback strategy.
+    Handle LLM provider errors.
     
     Args:
-        error: LLMProviderError instance
-        fallback_providers: List of alternative providers to try
-    
+        error: LLM error
+        llm_context: Context about the LLM call
+        
     Returns:
-        Error handling result with fallback suggestions
+        Error handling result dictionary
     """
-    context = {
-        "provider": error.provider,
-        "error_type": error.error_type,
-        "retry_possible": error.retry_possible,
-        "fallback_providers": fallback_providers or [],
-    }
+    context = llm_context or {}
+    context["component"] = "llm_service"
     
-    logger.error(
-        f"LLM provider error | "
-        f"provider={error.provider} | "
-        f"error_type={error.error_type} | "
-        f"retry_possible={error.retry_possible}"
-    )
+    # LLM errors should be logged as warnings unless critical
+    log_level = "WARNING" if isinstance(error, LLMProviderError) else "ERROR"
     
-    result = ErrorHandler.handle_error(error, context)
-    
-    # Add fallback provider information
-    if fallback_providers:
-        result["fallback_available"] = True
-        result["fallback_providers"] = fallback_providers
-    
-    return result
+    handler = ErrorHandler()
+    return handler.handle_error(error, context, log_level=log_level)
 
 
 def handle_database_error(
-    error: DatabaseError,
-    operation: Optional[str] = None,
-    retry_count: int = 0,
-    max_retries: int = 3,
+    error: Exception,
+    db_context: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Handle database errors with retry strategy.
+    Handle database errors.
     
     Args:
-        error: DatabaseError instance
-        operation: Database operation that failed
-        retry_count: Current retry count
-        max_retries: Maximum retry attempts
-    
+        error: Database error
+        db_context: Context about the database operation
+        
     Returns:
-        Error handling result with retry information
+        Error handling result dictionary
     """
-    context = {
-        "operation": operation,
-        "error_type": error.error_type,
-        "retry_count": retry_count,
-        "max_retries": max_retries,
-        "should_retry": error.retry_possible and retry_count < max_retries,
-    }
+    context = db_context or {}
+    context["component"] = "database"
     
-    logger.error(
-        f"Database error | "
-        f"operation={operation} | "
-        f"error_type={error.error_type} | "
-        f"retry_count={retry_count}/{max_retries}"
-    )
-    
-    result = ErrorHandler.handle_error(error, context)
-    result["should_retry"] = context["should_retry"]
-    
-    return result
+    handler = ErrorHandler()
+    return handler.handle_error(error, context)
 
 
-def handle_notification_error(
-    error: NotificationError,
-    booking_id: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Handle notification delivery errors.
-    
-    Non-critical errors - log but don't fail the booking.
-    
-    Args:
-        error: NotificationError instance
-        booking_id: Booking ID for reference
-    
-    Returns:
-        Error handling result
-    """
-    context = {
-        "booking_id": booking_id,
-        "notification_type": error.notification_type,
-        "recipient": error.recipient,
-    }
-    
-    logger.warning(
-        f"Notification delivery failed | "
-        f"type={error.notification_type} | "
-        f"recipient={error.recipient} | "
-        f"booking_id={booking_id} | "
-        f"message={error.message}"
-    )
-    
-    # Log as warning since booking should still succeed
-    return ErrorHandler.handle_error(error, context, log_level="warning")
-
-
-def handle_timeout_error(
-    error: UserTimeoutError,
-    user_id: Optional[str] = None,
-    max_retries: int = 2,
-) -> Dict[str, Any]:
-    """
-    Handle user timeout errors.
-    
-    Args:
-        error: UserTimeoutError instance
-        user_id: User identifier
-        max_retries: Maximum retry attempts before ending conversation
-    
-    Returns:
-        Error handling result with retry/end decision
-    """
-    context = {
-        "user_id": user_id,
-        "timeout_seconds": error.timeout_seconds,
-        "retry_count": error.retry_count,
-        "max_retries": max_retries,
-        "should_end_conversation": error.retry_count >= max_retries,
-    }
-    
-    logger.warning(
-        f"User timeout | "
-        f"user_id={user_id} | "
-        f"timeout={error.timeout_seconds}s | "
-        f"retry_count={error.retry_count}/{max_retries}"
-    )
-    
-    result = ErrorHandler.handle_error(error, context, log_level="warning")
-    result["should_end_conversation"] = context["should_end_conversation"]
-    
-    return result
-
-
-def with_error_handling(
-    operation_name: str,
-    log_context: Optional[Dict[str, Any]] = None,
-) -> Callable:
-    """
-    Decorator for adding error handling to functions.
-    
-    Args:
-        operation_name: Name of the operation for logging
-        log_context: Additional context for logging
-    
-    Returns:
-        Decorator function
-    
-    Example:
-        @with_error_handling("create_booking", {"user_id": "123"})
-        def create_booking(data):
-            # ... booking logic ...
-            pass
-    """
-    def decorator(func: Callable) -> Callable:
-        def wrapper(*args, **kwargs):
-            try:
-                logger.debug(f"Starting operation: {operation_name}")
-                result = func(*args, **kwargs)
-                logger.debug(f"Completed operation: {operation_name}")
-                return result
-            except BookingSystemError as e:
-                logger.error(
-                    f"Operation failed: {operation_name} | "
-                    f"error={type(e).__name__} | "
-                    f"message={str(e)}"
-                )
-                if log_context:
-                    logger.error(f"Context: {log_context}")
-                raise
-            except Exception as e:
-                logger.error(
-                    f"Unexpected error in operation: {operation_name} | "
-                    f"error={type(e).__name__} | "
-                    f"message={str(e)}"
-                )
-                if log_context:
-                    logger.error(f"Context: {log_context}")
-                raise
-        return wrapper
-    return decorator
-
+# ============================================================================
+# Logging Utilities
+# ============================================================================
 
 def log_error_with_context(
     error: Exception,
-    operation: str,
-    user_id: Optional[str] = None,
-    conversation_state: Optional[str] = None,
-    additional_context: Optional[Dict[str, Any]] = None,
+    context: Optional[Dict[str, Any]] = None,
+    level: str = "ERROR",
+    include_traceback: bool = True
 ) -> None:
     """
-    Log error with full context for debugging.
+    Log error with full context information.
     
     Args:
-        error: Exception that occurred
-        operation: Operation being performed
-        user_id: User identifier
-        conversation_state: Current conversation state
-        additional_context: Any additional context
+        error: Exception to log
+        context: Additional context information
+        level: Log level (ERROR, WARNING, INFO)
+        include_traceback: Whether to include full stack trace
     """
-    context = {
-        "operation": operation,
-        "user_id": user_id,
-        "conversation_state": conversation_state,
-        "error_type": type(error).__name__,
-        "error_message": str(error),
-    }
+    context = context or {}
     
-    if additional_context:
-        context.update(additional_context)
+    # Build log message
+    error_type = type(error).__name__
+    error_message = str(error)
     
-    # Include stack trace for non-BookingSystemError exceptions
-    if not isinstance(error, BookingSystemError):
-        logger.exception(f"Error in {operation}: {context}")
-    else:
-        logger.error(f"Error in {operation}: {context}")
+    # Format context for logging
+    context_str = ", ".join([f"{k}={v}" for k, v in context.items()])
+    
+    log_message = f"{error_type}: {error_message}"
+    if context_str:
+        log_message += f" | Context: {context_str}"
+    
+    # Log with appropriate level
+    log_func = getattr(logger, level.lower(), logger.error)
+    
+    if include_traceback:
+        # Get traceback
+        tb_str = "".join(traceback.format_exception(
+            type(error), error, error.__traceback__
+        ))
+        log_message += f"\n{tb_str}"
+    
+    log_func(log_message)
+
+
+def log_recovery_attempt(
+    error: Exception,
+    recovery_strategy: str,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Log a recovery attempt for an error.
+    
+    Args:
+        error: Original error
+        recovery_strategy: Description of recovery strategy
+        context: Additional context
+    """
+    context = context or {}
+    context["recovery_strategy"] = recovery_strategy
+    
+    logger.info(
+        f"Attempting recovery from {type(error).__name__}: {recovery_strategy}"
+    )
+
+
+def log_recovery_success(
+    error: Exception,
+    recovery_strategy: str,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Log successful error recovery.
+    
+    Args:
+        error: Original error that was recovered from
+        recovery_strategy: Description of recovery strategy
+        context: Additional context
+    """
+    context = context or {}
+    context["recovery_strategy"] = recovery_strategy
+    
+    logger.info(
+        f"Successfully recovered from {type(error).__name__} using {recovery_strategy}"
+    )
+
+
+def log_recovery_failure(
+    error: Exception,
+    recovery_strategy: str,
+    context: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Log failed error recovery.
+    
+    Args:
+        error: Original error
+        recovery_strategy: Description of failed recovery strategy
+        context: Additional context
+    """
+    context = context or {}
+    context["recovery_strategy"] = recovery_strategy
+    
+    logger.warning(
+        f"Failed to recover from {type(error).__name__} using {recovery_strategy}"
+    )
+
+
+# ============================================================================
+# Retry Utilities
+# ============================================================================
+
+def with_retry(
+    func: Callable[..., T],
+    max_retries: int = 3,
+    delay: float = 1.0,
+    backoff: float = 2.0,
+    retriable_exceptions: tuple = (Exception,),
+    on_retry: Optional[Callable[[Exception, int], None]] = None
+) -> Callable[..., T]:
+    """
+    Decorator to add retry logic to a function.
+    
+    Args:
+        func: Function to wrap with retry logic
+        max_retries: Maximum number of retry attempts
+        delay: Initial delay between retries (seconds)
+        backoff: Multiplier for delay after each retry
+        retriable_exceptions: Tuple of exception types to retry
+        on_retry: Optional callback called before each retry
+        
+    Returns:
+        Wrapped function with retry logic
+    """
+    import time
+    
+    def wrapper(*args, **kwargs):
+        current_delay = delay
+        last_exception = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except retriable_exceptions as e:
+                last_exception = e
+                
+                if attempt < max_retries:
+                    # Log retry attempt
+                    logger.warning(
+                        f"Attempt {attempt + 1}/{max_retries} failed for {func.__name__}: {e}. "
+                        f"Retrying in {current_delay:.2f}s..."
+                    )
+                    
+                    # Call retry callback if provided
+                    if on_retry:
+                        on_retry(e, attempt + 1)
+                    
+                    # Wait before retry
+                    time.sleep(current_delay)
+                    current_delay *= backoff
+                else:
+                    # Max retries reached
+                    logger.error(
+                        f"Max retries ({max_retries}) reached for {func.__name__}: {e}"
+                    )
+                    raise
+        
+        # Should not reach here, but just in case
+        if last_exception:
+            raise last_exception
+    
+    return wrapper
+
+
+def is_retriable_error(error: Exception) -> bool:
+    """
+    Check if an error is retriable.
+    
+    Args:
+        error: Exception to check
+        
+    Returns:
+        True if error should be retried
+    """
+    # Database errors with can_retry flag
+    if isinstance(error, DatabaseError) and error.can_retry:
+        return True
+    
+    # LLM errors with can_retry flag
+    if isinstance(error, LLMProviderError) and error.can_retry:
+        return True
+    
+    # Timeout errors are retriable
+    if isinstance(error, UserTimeoutError):
+        return error.retry_count < error.max_retries
+    
+    # Audio processing errors might be retriable
+    if isinstance(error, TranscriptionError) and error.reason in ["silence", "unclear_audio"]:
+        return True
+    
+    return False
