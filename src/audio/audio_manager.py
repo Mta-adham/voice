@@ -14,6 +14,16 @@ from loguru import logger
 
 from .config import AudioConfig, DEFAULT_CONFIG
 
+ # Import centralized error handling
+import sys
+sys.path.insert(0, '..')
+from error_handling.exceptions import (
+    AudioProcessingError,
+    SilenceDetectedError,
+    UnclearAudioError
+)
+from error_handling.handlers import log_function_call, with_retry
+ 
 # Import error handling
 try:
     from ..error_handling.exceptions import (
@@ -29,21 +39,12 @@ except ImportError:
     AudioProcessingError = Exception
     TranscriptionError = Exception
     UserTimeoutError = Exception
+ 
 
-
-class AudioDeviceError(Exception):
-    """Raised when audio device is not available or lacks permissions."""
-    pass
-
-
-class AudioRecordingError(Exception):
-    """Raised when audio recording fails."""
-    pass
-
-
-class AudioPlaybackError(Exception):
-    """Raised when audio playback fails."""
-    pass
+# Legacy exception aliases for backward compatibility
+AudioDeviceError = AudioProcessingError
+AudioRecordingError = AudioProcessingError
+AudioPlaybackError = AudioProcessingError
 
 
 class AudioManager:
@@ -97,41 +98,65 @@ class AudioManager:
         Check if audio devices are available.
         
         Raises:
-            AudioDeviceError: If no input or output devices are found.
+            AudioProcessingError: If no input or output devices are found.
         """
         try:
             devices = sd.query_devices()
             if devices is None or len(devices) == 0:
-                raise AudioDeviceError("No audio devices found")
+                raise AudioProcessingError(
+                    message="No audio devices found",
+                    user_message="I'm having trouble accessing audio devices. Please check your microphone and speaker connections.",
+                    audio_type="device",
+                    recoverable=False
+                )
             
             # Check for input device
             input_device = sd.query_devices(kind='input')
             if input_device is None:
-                raise AudioDeviceError("No input (microphone) device found")
+                raise AudioProcessingError(
+                    message="No input (microphone) device found",
+                    user_message="I can't access your microphone. Please check your microphone connection and permissions.",
+                    audio_type="recording",
+                    recoverable=False
+                )
             
             # Check for output device
             output_device = sd.query_devices(kind='output')
             if output_device is None:
-                raise AudioDeviceError("No output (speaker) device found")
+                raise AudioProcessingError(
+                    message="No output (speaker) device found",
+                    user_message="I can't access your speakers. Please check your speaker connection.",
+                    audio_type="playback",
+                    recoverable=False
+                )
             
             logger.debug(f"Input device: {input_device['name']}")
             logger.debug(f"Output device: {output_device['name']}")
             
         except Exception as e:
-            if isinstance(e, AudioDeviceError):
+            if isinstance(e, AudioProcessingError):
                 raise
-            raise AudioDeviceError(f"Failed to query audio devices: {str(e)}")
+            raise AudioProcessingError(
+                message=f"Failed to query audio devices: {str(e)}",
+                user_message="I'm having trouble accessing audio devices. Please check your audio setup.",
+                audio_type="device",
+                recoverable=False
+            )
     
+    @log_function_call
     def start_recording(self) -> None:
         """
         Start recording audio from the default microphone.
         
         Raises:
-            AudioRecordingError: If recording is already in progress or fails to start.
-            AudioDeviceError: If microphone is not accessible.
+            AudioProcessingError: If recording is already in progress or fails to start.
         """
         if self._recording:
-            raise AudioRecordingError("Recording already in progress")
+            raise AudioProcessingError(
+                message="Recording already in progress",
+                user_message="I'm already recording. Please finish the current recording first.",
+                audio_type="recording"
+            )
         
         try:
             self._audio_buffer = []
@@ -155,12 +180,21 @@ class AudioManager:
             self._recording = False
             self._stream = None
             logger.error(f"Failed to start recording: {str(e)}")
-            raise AudioDeviceError(f"Microphone not accessible: {str(e)}")
+            raise AudioProcessingError(
+                message=f"Microphone not accessible: {str(e)}",
+                user_message="I can't access your microphone. Please check your microphone permissions and connection.",
+                audio_type="recording",
+                recoverable=False
+            )
         except Exception as e:
             self._recording = False
             self._stream = None
             logger.error(f"Unexpected error during recording start: {str(e)}")
-            raise AudioRecordingError(f"Failed to start recording: {str(e)}")
+            raise AudioProcessingError(
+                message=f"Failed to start recording: {str(e)}",
+                user_message="I'm having trouble starting the recording. Please try again.",
+                audio_type="recording"
+            )
     
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         """
@@ -179,6 +213,7 @@ class AudioManager:
             # Copy audio data to buffer
             self._audio_buffer.append(indata.copy())
     
+    @log_function_call
     def stop_recording(self) -> Tuple[np.ndarray, int]:
         """
         Stop recording and return the captured audio data.
@@ -187,10 +222,15 @@ class AudioManager:
             Tuple of (audio_data, sample_rate) where audio_data is numpy array
         
         Raises:
-            AudioRecordingError: If no recording is in progress.
+            AudioProcessingError: If no recording is in progress.
+            SilenceDetectedError: If no audio was captured.
         """
         if not self._recording:
-            raise AudioRecordingError("No recording in progress")
+            raise AudioProcessingError(
+                message="No recording in progress",
+                user_message="I'm not currently recording. Please start recording first.",
+                audio_type="recording"
+            )
         
         try:
             self._recording = False
@@ -204,19 +244,48 @@ class AudioManager:
             # Concatenate audio buffer
             if not self._audio_buffer:
                 logger.warning("No audio data captured")
-                audio_data = np.array([], dtype=self.config.dtype)
-            else:
-                audio_data = np.concatenate(self._audio_buffer, axis=0)
+                raise SilenceDetectedError(
+                    message="No audio data captured",
+                    duration=0.0
+                )
+            
+            audio_data = np.concatenate(self._audio_buffer, axis=0)
+            
+            # Check for silence
+            duration = len(audio_data) / self.config.sample_rate
+            if duration < 0.1:  # Less than 100ms
+                logger.warning(f"Very short audio captured: {duration:.3f}s")
+                raise SilenceDetectedError(
+                    message=f"Audio too short: {duration:.3f}s",
+                    duration=duration
+                )
+            
+            # Check audio energy level
+            rms = np.sqrt(np.mean(audio_data.astype(float) ** 2))
+            if rms < 10:  # Very low energy
+                logger.warning(f"Very low audio energy: {rms:.2f}")
+                raise UnclearAudioError(
+                    message=f"Audio energy too low: {rms:.2f}",
+                    confidence_score=0.0
+                )
             
             logger.info(f"Recording stopped. Captured {len(audio_data)} samples "
-                       f"({len(audio_data) / self.config.sample_rate:.2f} seconds)")
+                       f"({duration:.2f} seconds, RMS={rms:.2f})")
             
             return audio_data, self.config.sample_rate
             
+        except (SilenceDetectedError, UnclearAudioError):
+            raise
         except Exception as e:
             logger.error(f"Error stopping recording: {str(e)}")
-            raise AudioRecordingError(f"Failed to stop recording: {str(e)}")
+            raise AudioProcessingError(
+                message=f"Failed to stop recording: {str(e)}",
+                user_message="I had trouble processing the recording. Please try again.",
+                audio_type="recording"
+            )
     
+    @log_function_call
+    @with_retry(max_attempts=2, delay=0.5, exceptions=(sd.PortAudioError,))
     def play_audio(self, audio_data: np.ndarray, sample_rate: Optional[int] = None) -> None:
         """
         Play audio data through the default speaker.
@@ -226,11 +295,18 @@ class AudioManager:
             sample_rate: Sample rate in Hz. If None, uses config sample rate.
         
         Raises:
-            AudioPlaybackError: If playback fails.
-            AudioDeviceError: If speaker is not accessible.
+            AudioProcessingError: If playback fails.
         """
         if sample_rate is None:
             sample_rate = self.config.sample_rate
+        
+        if audio_data is None or len(audio_data) == 0:
+            logger.warning("Attempted to play empty audio")
+            raise AudioProcessingError(
+                message="Cannot play empty audio",
+                user_message="I don't have any audio to play.",
+                audio_type="playback"
+            )
         
         try:
             logger.info(f"Playing audio: {len(audio_data)} samples at {sample_rate}Hz")
@@ -243,10 +319,19 @@ class AudioManager:
             
         except sd.PortAudioError as e:
             logger.error(f"Failed to play audio: {str(e)}")
-            raise AudioDeviceError(f"Speaker not accessible: {str(e)}")
+            raise AudioProcessingError(
+                message=f"Speaker not accessible: {str(e)}",
+                user_message="I can't access your speakers. Please check your speaker connection.",
+                audio_type="playback",
+                recoverable=False
+            )
         except Exception as e:
             logger.error(f"Unexpected error during playback: {str(e)}")
-            raise AudioPlaybackError(f"Failed to play audio: {str(e)}")
+            raise AudioProcessingError(
+                message=f"Failed to play audio: {str(e)}",
+                user_message="I'm having trouble playing the audio. Please check your speakers.",
+                audio_type="playback"
+            )
     
     def detect_silence(
         self,

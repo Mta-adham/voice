@@ -1,4 +1,11 @@
+""" 
+Custom exception classes for restaurant booking system error handling.
+
+This module defines a comprehensive hierarchy of exceptions for different
+error categories that can occur during the booking conversation flow.
 """
+from typing import Optional, Dict, Any, List
+ 
 Custom exception classes for restaurant booking voice agent.
 
 This module defines exception hierarchies for different error categories:
@@ -7,19 +14,21 @@ This module defines exception hierarchies for different error categories:
 - User interaction errors (timeout, ambiguity, interruptions)
 
 All exceptions include context information for better error handling and logging.
-"""
-
-from typing import Optional, Dict, Any
-from datetime import date, time
-
-
-# ============================================================================
-# Base Exception
-# ============================================================================
-
+""" 
+class BookingSystemError(Exception):
+    """
+    Base exception for all booking system errors.
+    
+    Attributes:
+        message: Human-readable error message
+        user_message: Natural language message suitable for voice output
+        context: Additional context information for debugging
+        recoverable: Whether the error is recoverable
+    """
+ 
 class BookingAgentError(Exception):
     """Base exception for all booking agent errors."""
-    
+     
     def __init__(
         self,
         message: str,
@@ -27,7 +36,7 @@ class BookingAgentError(Exception):
         context: Optional[Dict[str, Any]] = None,
         recoverable: bool = True
     ):
-        """
+         """
         Initialize booking agent error.
         
         Args:
@@ -41,24 +50,51 @@ class BookingAgentError(Exception):
         self.user_message = user_message or message
         self.context = context or {}
         self.recoverable = recoverable
-
-
+ 
+ 
 # ============================================================================
 # Business Logic Errors
 # ============================================================================
 
+class BookingValidationError(BookingSystemError):
+    """
+    Exception for booking validation failures.
+    
+    Raised when booking request violates business rules such as:
+    - Past dates
+    - Dates beyond booking window
+    - Party size exceeds maximum
+    - Invalid time slots 
 class BookingValidationError(BookingAgentError):
     """
     Exception raised when booking validation fails.
     
     This includes general validation errors for bookings that don't fit
-    other specific categories.
+    other specific categories. 
     """
     
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
+        validation_field: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.validation_field = validation_field
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            context=context,
+            recoverable=True
+        )
+
+
+class NoAvailabilityError(BookingSystemError):
+    """
+    Exception when no availability exists for requested date/time/party_size.
+    
+    Should include alternative time slots when possible.
+    """ 
         field: Optional[str] = None,
         value: Any = None,
         **kwargs
@@ -76,11 +112,41 @@ class BookingValidationError(BookingAgentError):
 
 class NoAvailabilityError(BookingAgentError):
     """Exception raised when no availability exists for the requested date/time/party_size."""
-    
+   
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
+         requested_date: Optional[date] = None,
+        requested_time: Optional[time] = None,
+        party_size: Optional[int] = None,
+        alternatives: Optional[List[Dict[str, Any]]] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.requested_date = requested_date
+        self.requested_time = requested_time
+        self.party_size = party_size
+        self.alternatives = alternatives or []
+        
+        ctx = context or {}
+        ctx.update({
+            "requested_date": str(requested_date) if requested_date else None,
+            "requested_time": str(requested_time) if requested_time else None,
+            "party_size": party_size,
+            "alternatives_count": len(self.alternatives)
+        })
+        
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            context=ctx,
+            recoverable=True
+        )
+
+
+class InvalidDateError(BookingValidationError):
+    """Exception for invalid dates (past dates, beyond booking window)."""
+ 
         date: Optional[date] = None,
         time: Optional[time] = None,
         party_size: Optional[int] = None,
@@ -104,11 +170,34 @@ class NoAvailabilityError(BookingAgentError):
 
 class InvalidDateError(BookingAgentError):
     """Exception raised when date is invalid (past date or beyond booking window)."""
-    
+     
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
+        invalid_date: Optional[date] = None,
+        reason: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.invalid_date = invalid_date
+        self.reason = reason
+        
+        ctx = context or {}
+        ctx.update({
+            "invalid_date": str(invalid_date) if invalid_date else None,
+            "reason": reason
+        })
+        
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            validation_field="date",
+            context=ctx
+        )
+
+
+class InvalidTimeError(BookingValidationError):
+    """Exception for invalid time slots (outside operating hours)."""
         date: Optional[date] = None,
         reason: Optional[str] = None,
         **kwargs
@@ -126,12 +215,35 @@ class InvalidDateError(BookingAgentError):
 
 class InvalidTimeError(BookingAgentError):
     """Exception raised when time is outside operating hours."""
-    
+     
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
-        time: Optional[time] = None,
+        invalid_time: Optional[time] = None,
+        operating_hours: Optional[Dict[str, str]] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.invalid_time = invalid_time
+        self.operating_hours = operating_hours
+        
+        ctx = context or {}
+        ctx.update({
+            "invalid_time": str(invalid_time) if invalid_time else None,
+            "operating_hours": operating_hours
+        })
+        
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            validation_field="time",
+            context=ctx
+        )
+
+
+class InvalidPartySizeError(BookingValidationError):
+    """Exception when party size exceeds maximum or is invalid."""
+         time: Optional[time] = None,
         operating_hours: Optional[tuple] = None,
         **kwargs
     ):
@@ -148,12 +260,30 @@ class InvalidTimeError(BookingAgentError):
 
 class PartySizeTooLargeError(BookingAgentError):
     """Exception raised when party size exceeds maximum allowed."""
-    
+     
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
         party_size: Optional[int] = None,
+        max_party_size: Optional[int] = None,
+        context: Optional[Dict[str, Any]] = None
+    ):
+        self.party_size = party_size
+        self.max_party_size = max_party_size
+        
+        ctx = context or {}
+        ctx.update({
+            "party_size": party_size,
+            "max_party_size": max_party_size
+        })
+        
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            validation_field="party_size",
+            context=ctx
+        ) 
         max_party_size: int = 8,
         **kwargs
     ):
@@ -166,19 +296,37 @@ class PartySizeTooLargeError(BookingAgentError):
         super().__init__(message, user_message, context, **kwargs)
         self.party_size = party_size
         self.max_party_size = max_party_size
-
+ 
 
 # ============================================================================
 # Technical Errors - Audio Processing
 # ============================================================================
-
+ 
 class AudioProcessingError(BookingAgentError):
     """Base exception for audio processing errors."""
-    
+     
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
+        audio_type: Optional[str] = None,  # "recording", "playback", "processing"
+        context: Optional[Dict[str, Any]] = None,
+        recoverable: bool = True
+    ):
+        self.audio_type = audio_type
+        ctx = context or {}
+        ctx["audio_type"] = audio_type
+        
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            context=ctx,
+            recoverable=recoverable
+        )
+
+
+class STTError(AudioProcessingError):
+    """Exception for Speech-to-Text (Whisper) failures."""
         audio_type: Optional[str] = None,  # "recording", "playback", "device"
         original_error: Optional[Exception] = None,
         **kwargs
@@ -196,26 +344,35 @@ class AudioProcessingError(BookingAgentError):
 
 class TranscriptionError(AudioProcessingError):
     """Exception raised when speech-to-text transcription fails."""
-    
+  
     def __init__(
         self,
         message: str,
         user_message: Optional[str] = None,
-        reason: Optional[str] = None,  # "unclear_audio", "api_failure", "silence"
-        **kwargs
+        provider: Optional[str] = None,
+        original_error: Optional[Exception] = None,
+        context: Optional[Dict[str, Any]] = None
     ):
-        context = kwargs.pop("context", {})
-        context.update({
-            "reason": reason,
-            "error_type": "transcription"
+        self.provider = provider
+        self.original_error = original_error
+        
+        ctx = context or {}
+        ctx.update({
+            "provider": provider,
+            "original_error": str(original_error) if original_error else None
         })
-        kwargs["audio_type"] = "transcription"
-        super().__init__(message, user_message, **kwargs, context=context)
-        self.reason = reason
+        
+        super().__init__(
+            message=message,
+            user_message=user_message,
+            audio_type="stt",
+            context=ctx,
+            recoverable=True
+        )
 
 
-class TextToSpeechError(AudioProcessingError):
-    """Exception raised when text-to-speech generation fails."""
+class TTSError(AudioProcessingError):
+    """Exception for Text-to-Speech failures."""
     
     def __init__(
         self,

@@ -39,24 +39,11 @@ except ImportError:
     EnhancedDatabaseError = Exception
 
 
-class BookingServiceError(Exception):
-    """Base exception for booking service errors."""
-    pass
-
-
-class ValidationError(BookingServiceError):
-    """Exception raised when booking validation fails."""
-    pass
-
-
-class CapacityError(BookingServiceError):
-    """Exception raised when there's insufficient capacity."""
-    pass
-
-
-class DatabaseError(BookingServiceError):
-    """Exception raised when database operations fail."""
-    pass
+# Legacy exception aliases for backward compatibility
+BookingServiceError = BookingValidationError
+ValidationError = BookingValidationError
+CapacityError = NoAvailabilityError
+DatabaseError = DBError
 
 
 class BookingService:
@@ -96,13 +83,19 @@ class BookingService:
         try:
             config = self.session.query(RestaurantConfig).filter_by(id=1).first()
             if not config:
-                raise DatabaseError(
-                    "Restaurant configuration not found. Please run database initialization."
+                raise DBError(
+                    message="Restaurant configuration not found. Please run database initialization.",
+                    error_type="query"
                 )
             self._config_cache = config
             return config
         except OperationalError as e:
-            raise DatabaseError(f"Database connection error: {str(e)}")
+            raise DBError(
+                message=f"Database connection error: {str(e)}",
+                error_type="connection",
+                original_error=e,
+                retry_possible=True
+            )
     
     def _parse_time(self, time_str: str) -> time:
         """
@@ -139,6 +132,8 @@ class BookingService:
         
         return open_time, close_time
     
+    @log_function_call
+    @with_retry(max_attempts=3, delay=0.5, exceptions=(OperationalError,))
     def get_available_slots(self, date: date, party_size: int) -> List[TimeSlotInfo]:
         """
         Returns all time slots on given date that have enough capacity for the party.
@@ -152,7 +147,25 @@ class BookingService:
             
         Raises:
             DatabaseError: If database query fails
+            InvalidPartySizeError: If party size is invalid
         """
+        # Validate party size first
+        if party_size < 1:
+            raise InvalidPartySizeError(
+                message="Party size must be at least 1",
+                user_message="I need at least one person for the reservation. How many people will be dining?",
+                party_size=party_size
+            )
+        
+        config = self._get_restaurant_config()
+        if party_size > config.max_party_size:
+            raise InvalidPartySizeError(
+                message=f"Party size {party_size} exceeds maximum {config.max_party_size}",
+                user_message=f"I'm sorry, but we can only accommodate parties of up to {config.max_party_size} people. For larger groups, please call us directly.",
+                party_size=party_size,
+                max_party_size=config.max_party_size
+            )
+        
         try:
             # Get all time slots for the date
             time_slots = self.session.query(TimeSlot).filter(
@@ -199,7 +212,12 @@ class BookingService:
             return available_slots
             
         except OperationalError as e:
-            raise DatabaseError(f"Database query failed: {str(e)}")
+            raise DBError(
+                message=f"Database query failed: {str(e)}",
+                error_type="query",
+                original_error=e,
+                retry_possible=True
+            )
     
     def validate_booking_request(
         self, 
@@ -291,6 +309,7 @@ class BookingService:
         
         return True, ""
     
+    @log_function_call
     def create_booking(self, booking_data: BookingCreate) -> Booking:
         """
         Create new booking and update time slot capacity.
@@ -307,20 +326,17 @@ class BookingService:
             Created Booking instance with confirmation ID
             
         Raises:
-            ValidationError: If booking validation fails
-            CapacityError: If insufficient capacity
+            BookingValidationError: If booking validation fails
+            NoAvailabilityError: If insufficient capacity
             DatabaseError: If database operation fails
         """
         try:
-            # Validate booking request
-            is_valid, error_msg = self.validate_booking_request(
+            # Validate booking request (will raise exceptions on failure)
+            self.validate_booking_request(
                 booking_data.date,
                 booking_data.time_slot,
                 booking_data.party_size
             )
-            
-            if not is_valid:
-                raise ValidationError(error_msg)
             
             # Start atomic transaction - get time slot with row lock
             time_slot = self.session.query(TimeSlot).filter(
@@ -401,23 +417,38 @@ class BookingService:
             
             # Check for duplicate booking
             if 'uq_booking_date_time_phone' in error_msg:
-                raise ValidationError(
-                    "A booking with this phone number already exists for this date and time"
+                raise BookingValidationError(
+                    message="A booking with this phone number already exists for this date and time",
+                    user_message="It looks like you already have a reservation at that time. Would you like to make a different reservation?",
+                    validation_field="phone"
                 )
             
-            raise DatabaseError(f"Database constraint violation: {error_msg}")
+            raise DBError(
+                message=f"Database constraint violation: {error_msg}",
+                error_type="constraint",
+                original_error=e
+            )
             
-        except (ValidationError, CapacityError):
+        except (BookingValidationError, NoAvailabilityError, InvalidDateError, InvalidTimeError, InvalidPartySizeError):
             self.session.rollback()
             raise
             
         except OperationalError as e:
             self.session.rollback()
-            raise DatabaseError(f"Database operation failed: {str(e)}")
+            raise DBError(
+                message=f"Database operation failed: {str(e)}",
+                error_type="query",
+                original_error=e,
+                retry_possible=True
+            )
             
         except Exception as e:
             self.session.rollback()
-            raise DatabaseError(f"Unexpected error creating booking: {str(e)}")
+            raise DBError(
+                message=f"Unexpected error creating booking: {str(e)}",
+                error_type="unknown",
+                original_error=e
+            )
     
     def generate_time_slots(self, date: date) -> None:
         """
@@ -485,8 +516,17 @@ class BookingService:
             
         except OperationalError as e:
             self.session.rollback()
-            raise DatabaseError(f"Database operation failed: {str(e)}")
+            raise DBError(
+                message=f"Database operation failed: {str(e)}",
+                error_type="query",
+                original_error=e,
+                retry_possible=True
+            )
             
         except Exception as e:
             self.session.rollback()
-            raise DatabaseError(f"Unexpected error generating time slots: {str(e)}")
+            raise DBError(
+                message=f"Unexpected error generating time slots: {str(e)}",
+                error_type="unknown",
+                original_error=e
+            )
