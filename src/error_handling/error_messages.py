@@ -426,7 +426,6 @@ def suggest_next_action(error: Exception) -> Optional[str]:
         return "Please contact the restaurant directly to make your reservation."
     else:
         return None
-=======
 )
 
 

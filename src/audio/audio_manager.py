@@ -386,6 +386,188 @@ class AudioManager:
         
         return is_silent
     
+    def record_with_timeout(
+        self,
+        max_duration: float,
+        timeout_after_silence: Optional[float] = None,
+        silence_threshold: Optional[float] = None,
+        silence_duration: Optional[float] = None
+    ) -> Tuple[np.ndarray, int, bool]:
+        """
+        Record audio with timeout and automatic stopping after silence.
+        
+        This method is useful for recording user responses where you want to:
+        1. Set a maximum recording duration
+        2. Automatically stop after detecting silence (user finished speaking)
+        
+        Args:
+            max_duration: Maximum recording duration in seconds
+            timeout_after_silence: Stop recording after this many seconds of silence (optional)
+            silence_threshold: Silence threshold in dB (optional)
+            silence_duration: Minimum silence duration to detect (optional)
+        
+        Returns:
+            Tuple of (audio_data, sample_rate, timed_out):
+                - audio_data: Recorded audio as numpy array
+                - sample_rate: Sample rate in Hz
+                - timed_out: True if max_duration was reached, False if stopped by silence
+        
+        Raises:
+            AudioRecordingError: If recording fails
+            AudioDeviceError: If microphone is not accessible
+        
+        Example:
+            >>> audio_data, rate, timed_out = audio_manager.record_with_timeout(
+            ...     max_duration=30.0,  # Max 30 seconds
+            ...     timeout_after_silence=3.0  # Stop after 3 seconds of silence
+            ... )
+            >>> if timed_out:
+            ...     print("User didn't respond in time")
+        """
+        import time
+        
+        # Start recording
+        self.start_recording()
+        
+        start_time = time.time()
+        timed_out = False
+        silence_start = None
+        
+        try:
+            while True:
+                # Check max duration
+                elapsed = time.time() - start_time
+                if elapsed >= max_duration:
+                    logger.info(f"Recording reached max duration: {max_duration}s")
+                    timed_out = True
+                    break
+                
+                # Check for silence if timeout_after_silence is set
+                if timeout_after_silence is not None:
+                    is_silent = self.detect_silence(
+                        threshold=silence_threshold,
+                        duration=silence_duration
+                    )
+                    
+                    if is_silent:
+                        if silence_start is None:
+                            silence_start = time.time()
+                            logger.debug("Silence detected, starting timeout counter")
+                        else:
+                            silence_elapsed = time.time() - silence_start
+                            if silence_elapsed >= timeout_after_silence:
+                                logger.info(f"Recording stopped after {silence_elapsed:.1f}s of silence")
+                                break
+                    else:
+                        # Reset silence timer if audio detected
+                        if silence_start is not None:
+                            logger.debug("Audio detected, resetting silence timer")
+                        silence_start = None
+                
+                # Small sleep to avoid busy waiting
+                time.sleep(0.1)
+            
+            # Stop recording and return audio
+            audio_data, sample_rate = self.stop_recording()
+            
+            return audio_data, sample_rate, timed_out
+            
+        except Exception as e:
+            # Ensure recording is stopped on error
+            if self._recording:
+                try:
+                    self.stop_recording()
+                except Exception:
+                    pass
+            raise
+    
+    def wait_for_speech(
+        self,
+        timeout: float = 10.0,
+        speech_threshold: Optional[float] = None,
+        min_speech_duration: float = 0.5
+    ) -> bool:
+        """
+        Wait for speech to begin, with timeout.
+        
+        Useful for detecting when a user starts speaking after a prompt.
+        
+        Args:
+            timeout: Maximum time to wait for speech in seconds
+            speech_threshold: Energy threshold above which is considered speech (dB)
+            min_speech_duration: Minimum duration of speech to confirm (seconds)
+        
+        Returns:
+            True if speech detected, False if timeout
+        
+        Raises:
+            AudioRecordingError: If no recording is in progress
+        
+        Example:
+            >>> audio_manager.start_recording()
+            >>> if audio_manager.wait_for_speech(timeout=10.0):
+            ...     print("User started speaking")
+            ... else:
+            ...     print("User timeout - no speech detected")
+        """
+        if not self._recording:
+            raise AudioRecordingError("No recording in progress")
+        
+        if speech_threshold is None:
+            # Use inverse of silence threshold (typically -40dB)
+            speech_threshold = self.config.silence_threshold + 10  # e.g., -30dB
+        
+        start_time = time.time()
+        speech_start = None
+        
+        while True:
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                logger.warning(f"Speech detection timed out after {timeout}s")
+                return False
+            
+            # Need enough audio buffer to analyze
+            if not self._audio_buffer or len(self._audio_buffer) == 0:
+                time.sleep(0.1)
+                continue
+            
+            # Get recent audio
+            audio_data = np.concatenate(self._audio_buffer, axis=0)
+            
+            # Get last 0.5 seconds
+            sample_size = int(0.5 * self.config.sample_rate)
+            if len(audio_data) < sample_size:
+                time.sleep(0.1)
+                continue
+            
+            recent_audio = audio_data[-sample_size:]
+            
+            # Calculate RMS energy
+            rms = np.sqrt(np.mean(recent_audio**2))
+            if rms < 1e-10:
+                db_level = -100.0
+            else:
+                db_level = 20 * np.log10(rms)
+            
+            # Check if speech detected
+            is_speech = db_level > speech_threshold
+            
+            if is_speech:
+                if speech_start is None:
+                    speech_start = time.time()
+                    logger.debug(f"Speech detected: {db_level:.2f}dB > {speech_threshold}dB")
+                else:
+                    speech_elapsed = time.time() - speech_start
+                    if speech_elapsed >= min_speech_duration:
+                        logger.info(f"Speech confirmed after {speech_elapsed:.2f}s")
+                        return True
+            else:
+                # Reset if silence detected
+                speech_start = None
+            
+            time.sleep(0.1)
+    
     def convert_sample_rate(
         self,
         audio_data: np.ndarray,

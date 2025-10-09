@@ -12,6 +12,7 @@ from typing import List, Tuple, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from sqlalchemy.exc import IntegrityError, OperationalError
+from loguru import logger
 
 from models.database import Booking, TimeSlot, RestaurantConfig
 from models.schemas import BookingCreate, TimeSlotInfo

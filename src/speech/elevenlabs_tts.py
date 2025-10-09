@@ -2,7 +2,8 @@
 ElevenLabs Text-to-Speech Integration.
 
 This module provides text-to-speech functionality using the ElevenLabs API
-with caching, retry logic, and audio format conversion for AudioManager compatibility.
+with caching, retry logic, fallback TTS options, and audio format conversion
+for AudioManager compatibility.
 """
 import hashlib
 import os
@@ -24,6 +25,21 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Import fallback TTS libraries
+try:
+    import pyttsx3
+    PYTTSX3_AVAILABLE = True
+except ImportError:
+    PYTTSX3_AVAILABLE = False
+    logger.warning("pyttsx3 not available for fallback TTS")
+
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
+    logger.warning("gTTS not available for fallback TTS")
 
 
 class ElevenLabsTTSError(Exception):
