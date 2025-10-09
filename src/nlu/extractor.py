@@ -106,7 +106,8 @@ def _parse_llm_response(response_text: str) -> Dict[str, Any]:
     """
     try:
         # Try to extract JSON from response (in case LLM added extra text)
-        # Look for JSON object pattern
+        # Some LLMs add explanatory text before/after the JSON, so we use regex
+        # to find the JSON object. The pattern handles nested braces up to 2 levels.
         json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
         matches = re.findall(json_pattern, response_text, re.DOTALL)
         

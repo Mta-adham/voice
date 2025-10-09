@@ -222,6 +222,8 @@ class ConversationStateManager:
         }
         
         # Track which fields were already set (for correction detection)
+        # This allows us to distinguish between initial collection and corrections
+        # (e.g., "Actually, make that 6 people instead of 4")
         collected_before = set(self.context.get_collected_fields())
         
         # Process each field update
