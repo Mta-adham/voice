@@ -354,13 +354,16 @@ def llm_chat(
     system_prompt: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 500,
+    enable_fallback: bool = True,
+    fallback_providers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Unified interface for calling different LLM providers.
+    Unified interface for calling different LLM providers with automatic failover.
     
     This function provides a consistent API for interacting with OpenAI GPT,
     Google Gemini, and Anthropic Claude models. It handles provider-specific
-    formatting, automatic retries, and error handling.
+    formatting, automatic retries, and error handling. If the primary provider
+    fails, it can automatically try fallback providers.
     
     Args:
         provider: LLM provider to use ("openai", "gemini", or "claude")
@@ -370,23 +373,28 @@ def llm_chat(
         temperature: Sampling temperature (0-2 for OpenAI, 0-1 for others).
                     Higher values make output more random.
         max_tokens: Maximum number of tokens to generate in the response
+        enable_fallback: If True, try alternative providers on failure
+        fallback_providers: List of providers to try if primary fails.
+                           If None, tries all other available providers.
     
     Returns:
         Dictionary containing:
             - content (str): The LLM's response text
             - provider (str): Which provider was used
             - tokens_used (int): Approximate token count
+            - attempted_providers (list): List of providers attempted (if fallback used)
     
     Raises:
         ValueError: If provider is not one of the supported providers
-        LLMError: If the API call fails after retries, or if API key is missing
+        LLMError: If all providers fail after retries
     
     Examples:
         >>> response = llm_chat(
         ...     provider="openai",
         ...     messages=[{"role": "user", "content": "Hello!"}],
         ...     temperature=0.7,
-        ...     max_tokens=100
+        ...     max_tokens=100,
+        ...     enable_fallback=True
         ... )
         >>> print(response["content"])
         "Hello! How can I help you today?"
@@ -394,7 +402,8 @@ def llm_chat(
         >>> response = llm_chat(
         ...     provider="gemini",
         ...     messages=[{"role": "user", "content": "What is AI?"}],
-        ...     system_prompt="You are a helpful AI assistant."
+        ...     system_prompt="You are a helpful AI assistant.",
+        ...     enable_fallback=False
         ... )
     """
     # Validate provider
@@ -420,29 +429,93 @@ def llm_chat(
         if msg["role"] not in ["user", "assistant", "system"]:
             raise ValueError("Message role must be 'user', 'assistant', or 'system'")
     
-    logger.debug(
-        f"Calling LLM | provider: {provider} | "
-        f"messages: {len(messages)} | "
-        f"temperature: {temperature} | "
-        f"max_tokens: {max_tokens}"
-    )
+    # Determine providers to try
+    providers_to_try = [provider]
+    if enable_fallback:
+        if fallback_providers:
+            # Use specified fallback providers
+            providers_to_try.extend([p for p in fallback_providers if p != provider])
+        else:
+            # Use all other providers as fallback
+            providers_to_try.extend([p for p in supported_providers if p != provider])
     
-    # Route to appropriate provider
-    try:
-        if provider == "openai":
-            return _call_openai(messages, system_prompt, temperature, max_tokens)
-        elif provider == "gemini":
-            return _call_gemini(messages, system_prompt, temperature, max_tokens)
-        elif provider == "claude":
-            return _call_claude(messages, system_prompt, temperature, max_tokens)
-    except LLMError:
-        # Re-raise LLMError as-is
-        raise
-    except Exception as e:
-        # Wrap any other exceptions
-        logger.error(f"Unexpected error calling {provider}: {e}")
-        raise LLMError(
-            f"Unexpected error calling {provider}: {str(e)}",
-            provider=provider,
-            original_error=e,
+    # Try each provider in order
+    attempted_providers = []
+    last_error = None
+    
+    for current_provider in providers_to_try:
+        attempted_providers.append(current_provider)
+        
+        logger.debug(
+            f"Calling LLM | provider: {current_provider} | "
+            f"messages: {len(messages)} | "
+            f"temperature: {temperature} | "
+            f"max_tokens: {max_tokens} | "
+            f"attempt: {len(attempted_providers)}/{len(providers_to_try)}"
         )
+        
+        try:
+            # Route to appropriate provider
+            if current_provider == "openai":
+                result = _call_openai(messages, system_prompt, temperature, max_tokens)
+            elif current_provider == "gemini":
+                result = _call_gemini(messages, system_prompt, temperature, max_tokens)
+            elif current_provider == "claude":
+                result = _call_claude(messages, system_prompt, temperature, max_tokens)
+            
+            # Success! Add attempted providers to result
+            if len(attempted_providers) > 1:
+                result["attempted_providers"] = attempted_providers
+                logger.warning(
+                    f"Primary provider {provider} failed, succeeded with fallback {current_provider}"
+                )
+            
+            return result
+            
+        except LLMError as e:
+            last_error = e
+            logger.warning(
+                f"Provider {current_provider} failed: {str(e)}. "
+                f"Fallback available: {len(attempted_providers) < len(providers_to_try)}"
+            )
+            
+            # If this was the last provider, re-raise
+            if current_provider == providers_to_try[-1]:
+                # Add context about all attempted providers
+                if len(attempted_providers) > 1:
+                    error_msg = (
+                        f"All LLM providers failed. Attempted: {', '.join(attempted_providers)}. "
+                        f"Last error from {current_provider}: {str(e)}"
+                    )
+                    raise LLMError(
+                        error_msg,
+                        provider=current_provider,
+                        original_error=e,
+                    )
+                else:
+                    raise
+            
+            # Otherwise continue to next provider
+            continue
+            
+        except Exception as e:
+            last_error = e
+            logger.error(f"Unexpected error calling {current_provider}: {e}")
+            
+            # If this was the last provider, raise
+            if current_provider == providers_to_try[-1]:
+                raise LLMError(
+                    f"Unexpected error with all providers. Last error from {current_provider}: {str(e)}",
+                    provider=current_provider,
+                    original_error=e,
+                )
+            
+            # Otherwise continue to next provider
+            continue
+    
+    # Should not reach here, but just in case
+    raise LLMError(
+        f"All providers failed. Attempted: {', '.join(attempted_providers)}",
+        provider=provider,
+        original_error=last_error,
+    )
