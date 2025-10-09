@@ -7,6 +7,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Optional, Tuple
+from datetime import datetime, timedelta
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -14,20 +15,36 @@ from loguru import logger
 
 from .config import AudioConfig, DEFAULT_CONFIG
 
+# Import error handling exceptions
+try:
+    from ..error_handling.exceptions import (
+        AudioDeviceError,
+        AudioRecordingError,
+        AudioPlaybackError,
+        SilenceDetectedError,
+        UserTimeoutError,
+    )
+except ImportError:
+    # Fallback to local exceptions if error_handling not available
+    class AudioDeviceError(Exception):
+        """Raised when audio device is not available or lacks permissions."""
+        pass
 
-class AudioDeviceError(Exception):
-    """Raised when audio device is not available or lacks permissions."""
-    pass
+    class AudioRecordingError(Exception):
+        """Raised when audio recording fails."""
+        pass
 
+    class AudioPlaybackError(Exception):
+        """Raised when audio playback fails."""
+        pass
 
-class AudioRecordingError(Exception):
-    """Raised when audio recording fails."""
-    pass
+    class SilenceDetectedError(Exception):
+        """Raised when only silence is detected."""
+        pass
 
-
-class AudioPlaybackError(Exception):
-    """Raised when audio playback fails."""
-    pass
+    class UserTimeoutError(Exception):
+        """Raised when user does not respond."""
+        pass
 
 
 class AudioManager:
@@ -65,6 +82,11 @@ class AudioManager:
         self._stream: Optional[sd.InputStream] = None
         self._audio_buffer: list = []
         self._temp_files: list[Path] = []
+        
+        # Timeout tracking
+        self._recording_start_time: Optional[datetime] = None
+        self._last_speech_time: Optional[datetime] = None
+        self._timeout_seconds: float = 10.0  # Default user timeout
         
         # Create temp directory if it doesn't exist
         self._temp_dir = Path(self.config.temp_dir)
@@ -106,9 +128,12 @@ class AudioManager:
                 raise
             raise AudioDeviceError(f"Failed to query audio devices: {str(e)}")
     
-    def start_recording(self) -> None:
+    def start_recording(self, timeout_seconds: Optional[float] = None) -> None:
         """
         Start recording audio from the default microphone.
+        
+        Args:
+            timeout_seconds: Maximum recording duration before timeout (None for no limit)
         
         Raises:
             AudioRecordingError: If recording is already in progress or fails to start.
@@ -120,8 +145,13 @@ class AudioManager:
         try:
             self._audio_buffer = []
             self._recording = True
+            self._recording_start_time = datetime.now()
+            self._last_speech_time = None
             
-            logger.info("Starting audio recording...")
+            if timeout_seconds is not None:
+                self._timeout_seconds = timeout_seconds
+            
+            logger.info(f"Starting audio recording (timeout: {self._timeout_seconds}s)...")
             
             # Create input stream
             self._stream = sd.InputStream(
@@ -231,6 +261,72 @@ class AudioManager:
         except Exception as e:
             logger.error(f"Unexpected error during playback: {str(e)}")
             raise AudioPlaybackError(f"Failed to play audio: {str(e)}")
+    
+    def check_user_timeout(self) -> Tuple[bool, float]:
+        """
+        Check if user has timed out (no response for too long).
+        
+        Returns:
+            Tuple of (is_timeout, elapsed_seconds)
+        """
+        if not self._recording or self._recording_start_time is None:
+            return False, 0.0
+        
+        elapsed = (datetime.now() - self._recording_start_time).total_seconds()
+        is_timeout = elapsed >= self._timeout_seconds
+        
+        if is_timeout:
+            logger.warning(f"User timeout detected: {elapsed:.1f}s elapsed")
+        
+        return is_timeout, elapsed
+    
+    def has_speech_activity(self, threshold: Optional[float] = None) -> bool:
+        """
+        Check if there is speech activity in the current buffer.
+        
+        Args:
+            threshold: RMS threshold for speech detection
+        
+        Returns:
+            True if speech detected, False otherwise
+        """
+        if not self._audio_buffer:
+            return False
+        
+        if threshold is None:
+            threshold = -40  # Default speech threshold in dB
+        
+        # Get recent audio
+        audio_data = np.concatenate(self._audio_buffer[-10:], axis=0) if len(self._audio_buffer) >= 10 else np.concatenate(self._audio_buffer, axis=0)
+        
+        # Calculate RMS energy
+        rms = np.sqrt(np.mean(audio_data ** 2))
+        
+        if rms < 1e-10:
+            return False
+        
+        db_level = 20 * np.log10(rms)
+        has_speech = db_level > threshold
+        
+        if has_speech:
+            self._last_speech_time = datetime.now()
+        
+        return has_speech
+    
+    def get_silence_duration(self) -> float:
+        """
+        Get duration of silence since last speech activity.
+        
+        Returns:
+            Silence duration in seconds
+        """
+        if self._last_speech_time is None:
+            # No speech detected yet
+            if self._recording_start_time:
+                return (datetime.now() - self._recording_start_time).total_seconds()
+            return 0.0
+        
+        return (datetime.now() - self._last_speech_time).total_seconds()
     
     def detect_silence(
         self,

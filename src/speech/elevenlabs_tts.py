@@ -547,3 +547,203 @@ class ElevenLabsTTS:
         except Exception as e:
             logger.error(f"Failed to clear cache: {str(e)}")
             raise ElevenLabsTTSError(f"Failed to clear cache: {str(e)}")
+
+
+# ============================================================================
+# Fallback TTS Functions
+# ============================================================================
+
+def _fallback_tts_pyttsx3(text: str, sample_rate: int = 16000) -> Tuple[np.ndarray, int]:
+    """
+    Fallback TTS using pyttsx3 (offline, cross-platform).
+    
+    Args:
+        text: Text to synthesize
+        sample_rate: Target sample rate
+        
+    Returns:
+        Tuple of (audio_data, sample_rate)
+    """
+    try:
+        import pyttsx3
+        import tempfile
+        import wave
+        
+        logger.info("Using pyttsx3 fallback TTS")
+        
+        # Initialize pyttsx3 engine
+        engine = pyttsx3.init()
+        
+        # Configure voice properties
+        engine.setProperty('rate', 150)  # Speech rate
+        engine.setProperty('volume', 0.9)  # Volume (0.0 to 1.0)
+        
+        # Save to temporary WAV file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+        
+        try:
+            engine.save_to_file(text, str(temp_path))
+            engine.runAndWait()
+            
+            # Load the generated audio
+            audio_data, original_rate = sf.read(temp_path)
+            
+            # Convert to mono if needed
+            if audio_data.ndim == 2:
+                audio_data = np.mean(audio_data, axis=1)
+            
+            # Resample if needed
+            if original_rate != sample_rate:
+                ratio = sample_rate / original_rate
+                new_length = int(len(audio_data) * ratio)
+                indices = np.linspace(0, len(audio_data) - 1, new_length)
+                audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data)
+            
+            # Convert to int16
+            if audio_data.dtype != np.int16:
+                audio_data = np.clip(audio_data, -1.0, 1.0)
+                audio_data = (audio_data * 32767).astype(np.int16)
+            
+            logger.info("pyttsx3 TTS successful")
+            return audio_data, sample_rate
+            
+        finally:
+            # Clean up temp file
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            
+    except ImportError:
+        logger.error("pyttsx3 not installed. Install with: pip install pyttsx3")
+        raise
+    except Exception as e:
+        logger.error(f"pyttsx3 TTS failed: {e}")
+        raise
+
+
+def _fallback_tts_gtts(text: str, sample_rate: int = 16000, lang: str = "en") -> Tuple[np.ndarray, int]:
+    """
+    Fallback TTS using gTTS (Google Text-to-Speech, requires internet).
+    
+    Args:
+        text: Text to synthesize
+        sample_rate: Target sample rate
+        lang: Language code
+        
+    Returns:
+        Tuple of (audio_data, sample_rate)
+    """
+    try:
+        from gtts import gTTS
+        import tempfile
+        
+        logger.info("Using gTTS fallback TTS")
+        
+        # Generate speech with gTTS
+        tts = gTTS(text=text, lang=lang, slow=False)
+        
+        # Save to temporary MP3 file
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+        
+        try:
+            tts.save(str(temp_path))
+            
+            # Load the generated audio
+            audio_data, original_rate = sf.read(temp_path)
+            
+            # Convert to mono if needed
+            if audio_data.ndim == 2:
+                audio_data = np.mean(audio_data, axis=1)
+            
+            # Resample if needed
+            if original_rate != sample_rate:
+                ratio = sample_rate / original_rate
+                new_length = int(len(audio_data) * ratio)
+                indices = np.linspace(0, len(audio_data) - 1, new_length)
+                audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data)
+            
+            # Convert to int16
+            if audio_data.dtype != np.int16:
+                audio_data = np.clip(audio_data, -1.0, 1.0)
+                audio_data = (audio_data * 32767).astype(np.int16)
+            
+            logger.info("gTTS TTS successful")
+            return audio_data, sample_rate
+            
+        finally:
+            # Clean up temp file
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            
+    except ImportError:
+        logger.error("gTTS not installed. Install with: pip install gtts")
+        raise
+    except Exception as e:
+        logger.error(f"gTTS TTS failed: {e}")
+        raise
+
+
+def generate_speech_with_fallback(
+    text: str,
+    primary_tts: Optional[ElevenLabsTTS] = None,
+    use_fallback: bool = True
+) -> Tuple[np.ndarray, int]:
+    """
+    Generate speech with automatic fallback to alternative TTS engines.
+    
+    Tries in order:
+    1. ElevenLabs (if provided and available)
+    2. gTTS (requires internet)
+    3. pyttsx3 (offline, always available)
+    
+    Args:
+        text: Text to synthesize
+        primary_tts: Optional ElevenLabsTTS instance to try first
+        use_fallback: Whether to use fallback engines if primary fails
+        
+    Returns:
+        Tuple of (audio_data, sample_rate)
+        
+    Raises:
+        Exception: If all TTS engines fail
+    """
+    errors = []
+    
+    # Try ElevenLabs first if provided
+    if primary_tts:
+        try:
+            logger.info("Attempting primary TTS (ElevenLabs)")
+            return primary_tts.generate_speech(text)
+        except Exception as e:
+            logger.warning(f"Primary TTS failed: {e}")
+            errors.append(("ElevenLabs", e))
+            
+            if not use_fallback:
+                raise
+    
+    # Try fallback engines
+    if use_fallback:
+        # Try gTTS (better quality but needs internet)
+        try:
+            logger.info("Attempting gTTS fallback")
+            return _fallback_tts_gtts(text)
+        except Exception as e:
+            logger.warning(f"gTTS fallback failed: {e}")
+            errors.append(("gTTS", e))
+        
+        # Try pyttsx3 (offline, always works)
+        try:
+            logger.info("Attempting pyttsx3 fallback")
+            return _fallback_tts_pyttsx3(text)
+        except Exception as e:
+            logger.error(f"pyttsx3 fallback failed: {e}")
+            errors.append(("pyttsx3", e))
+    
+    # All engines failed
+    error_summary = "; ".join([f"{engine}: {str(err)}" for engine, err in errors])
+    raise ElevenLabsTTSError(f"All TTS engines failed: {error_summary}")

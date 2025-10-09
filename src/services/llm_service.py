@@ -446,3 +446,131 @@ def llm_chat(
             provider=provider,
             original_error=e,
         )
+
+
+def llm_chat_with_fallback(
+    messages: List[Dict[str, str]],
+    system_prompt: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 500,
+    preferred_provider: str = "openai",
+    fallback_providers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Call LLM with automatic fallback to alternative providers.
+    
+    Tries providers in order:
+    1. Preferred provider
+    2. Each fallback provider in order
+    
+    Args:
+        messages: List of chat messages
+        system_prompt: Optional system prompt
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens to generate
+        preferred_provider: Primary provider to try first
+        fallback_providers: List of fallback providers (if None, tries all others)
+    
+    Returns:
+        Dictionary with LLM response
+        
+    Raises:
+        LLMError: If all providers fail
+    
+    Example:
+        >>> response = llm_chat_with_fallback(
+        ...     messages=[{"role": "user", "content": "Hello"}],
+        ...     preferred_provider="openai",
+        ...     fallback_providers=["gemini", "claude"]
+        ... )
+    """
+    # Import error handling exceptions
+    try:
+        from ..error_handling.exceptions import AllLLMProvidersFailed, LLMProviderError
+    except ImportError:
+        # Fallback if error_handling not available
+        class AllLLMProvidersFailed(Exception):
+            def __init__(self, message, failed_providers=None):
+                super().__init__(message)
+                self.failed_providers = failed_providers or {}
+        
+        class LLMProviderError(Exception):
+            pass
+    
+    # Default fallback providers
+    if fallback_providers is None:
+        all_providers = ["openai", "gemini", "claude"]
+        fallback_providers = [p for p in all_providers if p != preferred_provider]
+    
+    # Track failures
+    failed_providers = {}
+    
+    # Try preferred provider first
+    providers_to_try = [preferred_provider] + fallback_providers
+    
+    for provider in providers_to_try:
+        try:
+            logger.info(f"Attempting LLM call with provider: {provider}")
+            
+            response = llm_chat(
+                provider=provider,
+                messages=messages,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            
+            # Success!
+            if provider != preferred_provider:
+                logger.warning(
+                    f"Fallback provider {provider} succeeded after {preferred_provider} failed"
+                )
+            
+            return response
+            
+        except LLMError as e:
+            logger.warning(f"Provider {provider} failed: {str(e)}")
+            failed_providers[provider] = e
+            
+            # Check if this is a fatal error (API key missing, etc.)
+            error_msg = str(e).lower()
+            if "api key" in error_msg or "authentication" in error_msg:
+                logger.info(f"Provider {provider} has configuration issue, skipping to next")
+                continue
+            
+            # For other errors, continue to next provider
+            continue
+            
+        except Exception as e:
+            logger.error(f"Unexpected error with provider {provider}: {str(e)}")
+            failed_providers[provider] = e
+            continue
+    
+    # All providers failed
+    logger.error(f"All LLM providers failed: {failed_providers}")
+    
+    raise AllLLMProvidersFailed(
+        f"All LLM providers failed. Tried: {', '.join(providers_to_try)}",
+        failed_providers=failed_providers
+    )
+
+
+def get_available_providers() -> List[str]:
+    """
+    Get list of available LLM providers (those with API keys configured).
+    
+    Returns:
+        List of provider names that have API keys configured
+    """
+    available = []
+    
+    for provider in ["openai", "gemini", "claude"]:
+        try:
+            get_api_key(provider)
+            available.append(provider)
+        except ValueError:
+            # API key not configured
+            pass
+    
+    logger.debug(f"Available LLM providers: {available}")
+    return available

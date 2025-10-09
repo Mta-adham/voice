@@ -12,28 +12,75 @@ from typing import List, Tuple, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from sqlalchemy.exc import IntegrityError, OperationalError
+from loguru import logger
 
 from models.database import Booking, TimeSlot, RestaurantConfig
 from models.schemas import BookingCreate, TimeSlotInfo
 
+# Import centralized error handling
+try:
+    from ..error_handling.exceptions import (
+        BookingValidationError,
+        NoAvailabilityError,
+        CapacityExceededError,
+        DatabaseError,
+        DatabaseConnectionError,
+        DatabaseQueryError,
+    )
+    from ..error_handling.handlers import handle_errors, retry_on_error
+except ImportError:
+    # Fallback to local exceptions if error_handling not available
+    logger.warning("Centralized error handling not available, using local exceptions")
+    
+    class BookingValidationError(Exception):
+        """Exception raised when booking validation fails."""
+        pass
+    
+    class NoAvailabilityError(Exception):
+        """Exception raised when there is no availability."""
+        pass
+    
+    class CapacityExceededError(Exception):
+        """Exception raised when there's insufficient capacity."""
+        pass
+    
+    class DatabaseError(Exception):
+        """Exception raised when database operations fail."""
+        pass
+    
+    class DatabaseConnectionError(DatabaseError):
+        """Exception raised when database connection fails."""
+        pass
+    
+    class DatabaseQueryError(DatabaseError):
+        """Exception raised when database query fails."""
+        pass
+    
+    # Mock decorators if not available
+    def handle_errors(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    
+    def retry_on_error(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
+
+# Keep old exception names for backward compatibility
 class BookingServiceError(Exception):
-    """Base exception for booking service errors."""
+    """Base exception for booking service errors (deprecated, use BookingValidationError)."""
     pass
 
 
-class ValidationError(BookingServiceError):
-    """Exception raised when booking validation fails."""
+class ValidationError(BookingValidationError):
+    """Deprecated alias for BookingValidationError."""
     pass
 
 
-class CapacityError(BookingServiceError):
-    """Exception raised when there's insufficient capacity."""
-    pass
-
-
-class DatabaseError(BookingServiceError):
-    """Exception raised when database operations fail."""
+class CapacityError(CapacityExceededError):
+    """Deprecated alias for CapacityExceededError."""
     pass
 
 
@@ -58,6 +105,7 @@ class BookingService:
         self.session = session
         self._config_cache: Optional[RestaurantConfig] = None
     
+    @retry_on_error(max_retries=3, exceptions=(OperationalError,), backoff_factor=1.0)
     def _get_restaurant_config(self) -> RestaurantConfig:
         """
         Get restaurant configuration from database with caching.
@@ -75,12 +123,17 @@ class BookingService:
             config = self.session.query(RestaurantConfig).filter_by(id=1).first()
             if not config:
                 raise DatabaseError(
-                    "Restaurant configuration not found. Please run database initialization."
+                    "Restaurant configuration not found. Please run database initialization.",
+                    user_message="I'm having trouble accessing the restaurant configuration. Please try again in a moment.",
+                    operation="get_config"
                 )
             self._config_cache = config
             return config
         except OperationalError as e:
-            raise DatabaseError(f"Database connection error: {str(e)}")
+            raise DatabaseConnectionError(
+                f"Database connection error: {str(e)}",
+                original_error=e
+            )
     
     def _parse_time(self, time_str: str) -> time:
         """
@@ -183,7 +236,8 @@ class BookingService:
         self, 
         date: date, 
         time: time, 
-        party_size: int
+        party_size: int,
+        raise_on_invalid: bool = False
     ) -> Tuple[bool, str]:
         """
         Validate booking request against business rules.
@@ -192,37 +246,97 @@ class BookingService:
             date: Requested booking date
             time: Requested booking time
             party_size: Number of people in the party
+            raise_on_invalid: If True, raise BookingValidationError instead of returning False
             
         Returns:
             Tuple of (is_valid, error_message). If valid, error_message is empty.
+            
+        Raises:
+            BookingValidationError: If raise_on_invalid=True and validation fails
         """
         config = self._get_restaurant_config()
         today = datetime.now().date()
         
         # Check date is not in the past
         if date < today:
-            return False, "Booking date cannot be in the past"
+            error_msg = "Booking date cannot be in the past"
+            if raise_on_invalid:
+                raise BookingValidationError(
+                    error_msg,
+                    field="date",
+                    value=date,
+                    context={"today": today}
+                )
+            return False, error_msg
         
         # Check date is not more than booking_window_days in the future
         max_date = today + timedelta(days=config.booking_window_days)
         if date > max_date:
-            return False, f"Bookings can only be made up to {config.booking_window_days} days in advance"
+            error_msg = f"Bookings can only be made up to {config.booking_window_days} days in advance"
+            if raise_on_invalid:
+                raise BookingValidationError(
+                    error_msg,
+                    field="date",
+                    value=date,
+                    context={
+                        "booking_window_days": config.booking_window_days,
+                        "max_date": max_date
+                    }
+                )
+            return False, error_msg
         
         # Check party_size is within allowed range
         if party_size < 1:
-            return False, "Party size must be at least 1"
+            error_msg = "Party size must be at least 1"
+            if raise_on_invalid:
+                raise BookingValidationError(
+                    error_msg,
+                    field="party_size",
+                    value=party_size
+                )
+            return False, error_msg
         
         if party_size > config.max_party_size:
-            return False, f"Party size cannot exceed {config.max_party_size} people"
+            error_msg = f"Party size cannot exceed {config.max_party_size} people"
+            if raise_on_invalid:
+                raise BookingValidationError(
+                    error_msg,
+                    field="party_size",
+                    value=party_size,
+                    context={"max_party_size": config.max_party_size}
+                )
+            return False, error_msg
         
         # Check requested time is within operating hours for that day of week
         open_time, close_time = self._get_operating_hours(date)
+        day_name = date.strftime('%A')
         
         if open_time is None or close_time is None:
-            return False, f"Restaurant is closed on {date.strftime('%A')}s"
+            error_msg = f"Restaurant is closed on {day_name}s"
+            if raise_on_invalid:
+                raise BookingValidationError(
+                    error_msg,
+                    field="date",
+                    value=date,
+                    context={"day_name": day_name}
+                )
+            return False, error_msg
         
         if not (open_time <= time < close_time):
-            return False, f"Requested time is outside operating hours ({open_time.strftime('%H:%M')} - {close_time.strftime('%H:%M')})"
+            error_msg = f"Requested time is outside operating hours ({open_time.strftime('%H:%M')} - {close_time.strftime('%H:%M')})"
+            if raise_on_invalid:
+                raise BookingValidationError(
+                    error_msg,
+                    field="time",
+                    value=time,
+                    context={
+                        "open_time": open_time.strftime('%H:%M'),
+                        "close_time": close_time.strftime('%H:%M'),
+                        "day_name": day_name,
+                        "requested_time": time.strftime('%H:%M')
+                    }
+                )
+            return False, error_msg
         
         return True, ""
     
@@ -255,7 +369,7 @@ class BookingService:
             )
             
             if not is_valid:
-                raise ValidationError(error_msg)
+                raise BookingValidationError(error_msg)
             
             # Start atomic transaction - get time slot with row lock
             time_slot = self.session.query(TimeSlot).filter(
@@ -283,8 +397,15 @@ class BookingService:
             # Verify availability (double-check with lock held)
             if not time_slot.is_available(booking_data.party_size):
                 remaining = time_slot.remaining_capacity()
-                raise CapacityError(
-                    f"Insufficient capacity. Only {remaining} seats remaining for this time slot."
+                raise CapacityExceededError(
+                    f"Insufficient capacity. Only {remaining} seats remaining for this time slot.",
+                    requested_size=booking_data.party_size,
+                    available_capacity=remaining,
+                    context={
+                        "date": booking_data.date,
+                        "time": booking_data.time_slot,
+                        "time_slot_id": time_slot.id
+                    }
                 )
             
             # Create booking
@@ -316,23 +437,41 @@ class BookingService:
             
             # Check for duplicate booking
             if 'uq_booking_date_time_phone' in error_msg:
-                raise ValidationError(
-                    "A booking with this phone number already exists for this date and time"
+                raise BookingValidationError(
+                    "A booking with this phone number already exists for this date and time",
+                    field="customer_phone",
+                    value=booking_data.customer_phone,
+                    context={
+                        "date": booking_data.date,
+                        "time": booking_data.time_slot
+                    }
                 )
             
-            raise DatabaseError(f"Database constraint violation: {error_msg}")
+            raise DatabaseError(
+                f"Database constraint violation: {error_msg}",
+                operation="create_booking",
+                original_error=e
+            )
             
-        except (ValidationError, CapacityError):
+        except (BookingValidationError, CapacityExceededError):
             self.session.rollback()
             raise
             
         except OperationalError as e:
             self.session.rollback()
-            raise DatabaseError(f"Database operation failed: {str(e)}")
+            raise DatabaseConnectionError(
+                f"Database operation failed: {str(e)}",
+                original_error=e
+            )
             
         except Exception as e:
             self.session.rollback()
-            raise DatabaseError(f"Unexpected error creating booking: {str(e)}")
+            logger.error(f"Unexpected error creating booking: {str(e)}")
+            raise DatabaseError(
+                f"Unexpected error creating booking: {str(e)}",
+                operation="create_booking",
+                original_error=e
+            )
     
     def generate_time_slots(self, date: date) -> None:
         """
