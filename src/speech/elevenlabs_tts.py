@@ -2,7 +2,8 @@
 ElevenLabs Text-to-Speech Integration.
 
 This module provides text-to-speech functionality using the ElevenLabs API
-with caching, retry logic, and audio format conversion for AudioManager compatibility.
+with caching, retry logic, fallback TTS options, and audio format conversion
+for AudioManager compatibility.
 """
 import hashlib
 import os
@@ -24,6 +25,21 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Import fallback TTS libraries
+try:
+    import pyttsx3
+    PYTTSX3_AVAILABLE = True
+except ImportError:
+    PYTTSX3_AVAILABLE = False
+    logger.warning("pyttsx3 not available for fallback TTS")
+
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
+    logger.warning("gTTS not available for fallback TTS")
 
 
 class ElevenLabsTTSError(Exception):
@@ -549,3 +565,305 @@ class ElevenLabsTTS:
         except Exception as e:
             logger.error(f"Failed to clear cache: {str(e)}")
             raise ElevenLabsTTSError(f"Failed to clear cache: {str(e)}")
+
+
+# ============================================================================
+# Fallback TTS Implementation
+# ============================================================================
+
+class FallbackTTS:
+    """
+    Fallback Text-to-Speech service using pyttsx3 (offline) or gTTS (online).
+    
+    This is used when ElevenLabs API is unavailable. It provides basic TTS
+    functionality to ensure the conversation can continue even with degraded quality.
+    """
+    
+    TARGET_SAMPLE_RATE = 16000  # Match ElevenLabs
+    TARGET_CHANNELS = 1  # Mono
+    TARGET_DTYPE = np.int16
+    
+    def __init__(self, use_gtts: bool = False):
+        """
+        Initialize fallback TTS.
+        
+        Args:
+            use_gtts: If True, use gTTS (online). If False, use pyttsx3 (offline).
+        """
+        self.use_gtts = use_gtts
+        self.provider = "gtts" if use_gtts else "pyttsx3"
+        
+        logger.warning(f"Using fallback TTS provider: {self.provider}")
+        
+        if not use_gtts:
+            try:
+                import pyttsx3
+                self.engine = pyttsx3.init()
+                # Set properties for better quality
+                self.engine.setProperty('rate', 150)  # Speaking rate
+                self.engine.setProperty('volume', 1.0)  # Volume
+            except Exception as e:
+                logger.error(f"Failed to initialize pyttsx3: {e}")
+                self.engine = None
+    
+    def generate_speech(
+        self,
+        text: str,
+        voice_id: Optional[str] = None
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Generate speech using fallback TTS.
+        
+        Args:
+            text: Text to convert to speech
+            voice_id: Ignored for fallback TTS
+            
+        Returns:
+            Tuple of (audio_data, sample_rate)
+            
+        Raises:
+            ElevenLabsTTSError: If generation fails
+        """
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+        
+        logger.info(f"Generating fallback TTS for text: '{text[:50]}...'")
+        
+        try:
+            if self.use_gtts:
+                return self._generate_with_gtts(text)
+            else:
+                return self._generate_with_pyttsx3(text)
+        except Exception as e:
+            logger.error(f"Fallback TTS generation failed: {e}")
+            raise ElevenLabsTTSError(f"Fallback TTS failed: {str(e)}")
+    
+    def _generate_with_gtts(self, text: str) -> Tuple[np.ndarray, int]:
+        """Generate speech using gTTS (Google Text-to-Speech)."""
+        try:
+            from gtts import gTTS
+            import tempfile
+            
+            # Generate speech
+            tts = gTTS(text=text, lang='en', slow=False)
+            
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+                tts.save(str(temp_path))
+            
+            try:
+                # Load audio
+                audio_data, original_rate = sf.read(temp_path)
+                
+                # Convert to target format
+                if audio_data.ndim == 2:
+                    audio_data = np.mean(audio_data, axis=1)
+                
+                # Resample if needed
+                if original_rate != self.TARGET_SAMPLE_RATE:
+                    ratio = self.TARGET_SAMPLE_RATE / original_rate
+                    new_length = int(len(audio_data) * ratio)
+                    indices = np.linspace(0, len(audio_data) - 1, new_length)
+                    audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data)
+                
+                # Convert to int16
+                if audio_data.dtype in (np.float32, np.float64):
+                    audio_data = np.clip(audio_data, -1.0, 1.0)
+                    audio_data = (audio_data * 32767).astype(np.int16)
+                
+                logger.info(f"gTTS generation successful: {len(audio_data)} samples")
+                return audio_data, self.TARGET_SAMPLE_RATE
+                
+            finally:
+                # Clean up temp file
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                    
+        except ImportError:
+            raise ElevenLabsTTSError(
+                "gTTS not installed. Install with: pip install gtts"
+            )
+        except Exception as e:
+            raise ElevenLabsTTSError(f"gTTS generation failed: {str(e)}")
+    
+    def _generate_with_pyttsx3(self, text: str) -> Tuple[np.ndarray, int]:
+        """Generate speech using pyttsx3 (offline TTS)."""
+        try:
+            import tempfile
+            
+            if self.engine is None:
+                raise ElevenLabsTTSError("pyttsx3 engine not initialized")
+            
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+            
+            try:
+                # Generate speech
+                self.engine.save_to_file(text, str(temp_path))
+                self.engine.runAndWait()
+                
+                # Load audio
+                audio_data, original_rate = sf.read(temp_path)
+                
+                # Convert to target format
+                if audio_data.ndim == 2:
+                    audio_data = np.mean(audio_data, axis=1)
+                
+                # Resample if needed
+                if original_rate != self.TARGET_SAMPLE_RATE:
+                    ratio = self.TARGET_SAMPLE_RATE / original_rate
+                    new_length = int(len(audio_data) * ratio)
+                    indices = np.linspace(0, len(audio_data) - 1, new_length)
+                    audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data)
+                
+                # Convert to int16
+                if audio_data.dtype in (np.float32, np.float64):
+                    audio_data = np.clip(audio_data, -1.0, 1.0)
+                    audio_data = (audio_data * 32767).astype(np.int16)
+                
+                logger.info(f"pyttsx3 generation successful: {len(audio_data)} samples")
+                return audio_data, self.TARGET_SAMPLE_RATE
+                
+            finally:
+                # Clean up temp file
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                    
+        except ImportError:
+            raise ElevenLabsTTSError(
+                "pyttsx3 not installed. Install with: pip install pyttsx3"
+            )
+        except Exception as e:
+            raise ElevenLabsTTSError(f"pyttsx3 generation failed: {str(e)}")
+
+
+# ============================================================================
+# Unified TTS with Automatic Fallback
+# ============================================================================
+
+class TTSWithFallback:
+    """
+    Unified TTS service that automatically falls back to alternative providers.
+    
+    Tries ElevenLabs first, then falls back to gTTS or pyttsx3 if unavailable.
+    This ensures the conversation can continue even if the primary TTS fails.
+    """
+    
+    def __init__(
+        self,
+        elevenlabs_api_key: Optional[str] = None,
+        voice_id: Optional[str] = None,
+        cache_dir: str = "cache/audio",
+        enable_fallback: bool = True,
+        prefer_gtts: bool = True
+    ):
+        """
+        Initialize TTS with fallback.
+        
+        Args:
+            elevenlabs_api_key: ElevenLabs API key
+            voice_id: ElevenLabs voice ID
+            cache_dir: Cache directory for audio files
+            enable_fallback: Whether to enable fallback TTS
+            prefer_gtts: If True, prefer gTTS over pyttsx3 for fallback
+        """
+        self.enable_fallback = enable_fallback
+        self.prefer_gtts = prefer_gtts
+        self.primary_tts = None
+        self.fallback_tts = None
+        self.using_fallback = False
+        
+        # Try to initialize ElevenLabs
+        try:
+            self.primary_tts = ElevenLabsTTS(
+                api_key=elevenlabs_api_key,
+                voice_id=voice_id,
+                cache_dir=cache_dir
+            )
+            logger.info("ElevenLabs TTS initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ElevenLabs TTS: {e}")
+            if enable_fallback:
+                logger.info("Will use fallback TTS from the start")
+                self.using_fallback = True
+            else:
+                raise
+        
+        # Initialize fallback if enabled
+        if enable_fallback:
+            try:
+                self.fallback_tts = FallbackTTS(use_gtts=prefer_gtts)
+                logger.info(f"Fallback TTS initialized: {self.fallback_tts.provider}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize fallback TTS: {e}")
+                # Try the other fallback option
+                try:
+                    self.fallback_tts = FallbackTTS(use_gtts=not prefer_gtts)
+                    logger.info(f"Alternative fallback TTS initialized: {self.fallback_tts.provider}")
+                except Exception as e2:
+                    logger.error(f"All fallback TTS options failed: {e2}")
+                    self.fallback_tts = None
+    
+    def generate_speech(
+        self,
+        text: str,
+        voice_id: Optional[str] = None
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Generate speech with automatic fallback.
+        
+        Args:
+            text: Text to convert to speech
+            voice_id: Voice ID (only used for ElevenLabs)
+            
+        Returns:
+            Tuple of (audio_data, sample_rate)
+            
+        Raises:
+            ElevenLabsTTSError: If all TTS providers fail
+        """
+        # Try primary TTS first (if not already using fallback)
+        if self.primary_tts and not self.using_fallback:
+            try:
+                return self.primary_tts.generate_speech(text, voice_id)
+            except (QuotaExceededError, APIKeyError) as e:
+                # These errors are not recoverable, switch to fallback permanently
+                logger.error(f"ElevenLabs TTS failure: {e}. Switching to fallback permanently.")
+                self.using_fallback = True
+                
+                if not self.enable_fallback or not self.fallback_tts:
+                    raise
+            except (RateLimitError, ElevenLabsTTSError) as e:
+                # These errors might be temporary, try fallback for this request
+                logger.warning(f"ElevenLabs TTS error: {e}. Using fallback for this request.")
+                
+                if not self.enable_fallback or not self.fallback_tts:
+                    raise
+        
+        # Use fallback TTS
+        if self.fallback_tts:
+            try:
+                logger.info("Using fallback TTS")
+                return self.fallback_tts.generate_speech(text)
+            except Exception as e:
+                logger.error(f"Fallback TTS also failed: {e}")
+                raise ElevenLabsTTSError(
+                    f"All TTS providers failed. Primary: disabled/failed, Fallback: {str(e)}"
+                )
+        
+        raise ElevenLabsTTSError("No TTS provider available")
+    
+    def get_current_provider(self) -> str:
+        """Get name of current TTS provider being used."""
+        if self.using_fallback and self.fallback_tts:
+            return self.fallback_tts.provider
+        elif self.primary_tts:
+            return "elevenlabs"
+        else:
+            return "none"

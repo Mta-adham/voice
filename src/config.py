@@ -2,7 +2,7 @@
 Configuration module for restaurant booking system.
 
 Loads environment variables and provides configuration settings including
-API keys for LLM providers.
+API keys for LLM providers and email notification settings.
 """
 import os
 from typing import Optional
@@ -19,6 +19,13 @@ class Settings(BaseSettings):
         openai_api_key: Optional OpenAI API key
         gemini_api_key: Optional Google Gemini API key
         anthropic_api_key: Optional Anthropic Claude API key
+        sendgrid_api_key: Optional SendGrid API key for email notifications
+        restaurant_name: Restaurant name for branding
+        restaurant_phone: Restaurant phone number
+        restaurant_address: Restaurant physical address
+        from_email: Email address to send from
+        reply_to_email: Email address for replies
+        directions_info: Directions and parking information
     """
     
     # Database configuration
@@ -44,6 +51,74 @@ class Settings(BaseSettings):
         default=None,
         alias="ANTHROPIC_API_KEY",
         description="Anthropic Claude API key"
+    )
+    
+    # Email Configuration (SendGrid)
+    sendgrid_api_key: Optional[str] = Field(
+        default=None,
+        alias="SENDGRID_API_KEY",
+        description="SendGrid API key for email notifications"
+    )
+    
+    from_email: str = Field(
+        default="noreply@restaurant.com",
+        alias="FROM_EMAIL",
+        description="Email address to send notifications from"
+    )
+    
+    reply_to_email: str = Field(
+        default="info@restaurant.com",
+        alias="REPLY_TO_EMAIL",
+        description="Email address for customer replies"
+    )
+    
+    # Restaurant Information
+    restaurant_name: str = Field(
+        default="The Grand Restaurant",
+        alias="RESTAURANT_NAME",
+        description="Restaurant name for branding"
+    )
+    
+    restaurant_phone: str = Field(
+        default="+1 (555) 123-4567",
+        alias="RESTAURANT_PHONE",
+        description="Restaurant phone number"
+    )
+    
+    restaurant_address: str = Field(
+        default="123 Main Street, City, State 12345",
+        alias="RESTAURANT_ADDRESS",
+        description="Restaurant physical address"
+    )
+    
+    directions_info: str = Field(
+        default="Street parking available. Valet service offered during dinner hours.",
+        alias="DIRECTIONS_INFO",
+        description="Directions and parking information"
+    # Twilio SMS Configuration
+    twilio_account_sid: Optional[str] = Field(
+        default=None,
+        alias="TWILIO_ACCOUNT_SID",
+        description="Twilio Account SID"
+    )
+    
+    twilio_auth_token: Optional[str] = Field(
+        default=None,
+        alias="TWILIO_AUTH_TOKEN",
+        description="Twilio Auth Token"
+    )
+    
+    twilio_phone_number: Optional[str] = Field(
+        default=None,
+        alias="TWILIO_PHONE_NUMBER",
+        description="Twilio phone number (sender)"
+    )
+    
+    # Restaurant Configuration
+    restaurant_name: str = Field(
+        default="Our Restaurant",
+        alias="RESTAURANT_NAME",
+        description="Restaurant name for confirmations"
     )
     
     class Config:

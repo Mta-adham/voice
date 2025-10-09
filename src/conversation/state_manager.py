@@ -15,6 +15,25 @@ from loguru import logger
 from .states import ConversationState
 from .context import ConversationContext
 
+# Import error handling
+try:
+    from error_handling.exceptions import (
+        BookingValidationError,
+        AmbiguousInputError,
+        UserTimeoutError,
+    )
+    from error_handling.handlers import (
+        handle_booking_error,
+        log_error_with_context,
+        ErrorHandler,
+    )
+    ERROR_HANDLING_AVAILABLE = True
+except ImportError:
+    ERROR_HANDLING_AVAILABLE = False
+    BookingValidationError = Exception
+    AmbiguousInputError = Exception
+    UserTimeoutError = Exception
+
 
 class StateTransitionError(Exception):
     """Exception raised when an invalid state transition is attempted."""
@@ -36,15 +55,36 @@ class ConversationStateManager:
         context: Current conversation context with all collected information
     """
     
-    def __init__(self, initial_state: ConversationState = ConversationState.GREETING):
+    def __init__(
+        self,
+        initial_state: ConversationState = ConversationState.GREETING,
+        enable_error_handling: bool = True
+    ):
         """
         Initialize the conversation state manager.
         
         Args:
             initial_state: Starting state for the conversation (default: GREETING)
+            enable_error_handling: Whether to enable enhanced error handling
         """
         self.context = ConversationContext(current_state=initial_state)
-        logger.info(f"ConversationStateManager initialized with state: {initial_state}")
+        self.enable_error_handling = enable_error_handling and ERROR_HANDLING_AVAILABLE
+        
+        # Initialize error handler if available
+        if self.enable_error_handling:
+            self.error_handler = ErrorHandler(log_errors=True, generate_messages=True)
+        else:
+            self.error_handler = None
+        
+        # Timeout tracking
+        self.last_interaction_time = None
+        self.timeout_count = 0
+        self.max_timeouts = 2
+        
+        logger.info(
+            f"ConversationStateManager initialized with state: {initial_state}, "
+            f"error_handling: {self.enable_error_handling}"
+        )
     
     def get_current_state(self) -> ConversationState:
         """
@@ -370,3 +410,153 @@ class ConversationStateManager:
             return self.update_context(**updates)
         
         return {"updated": [], "corrections": [], "errors": {}}
+    
+    # ========================================================================
+    # Enhanced Error Handling Methods
+    # ========================================================================
+    
+    def handle_validation_error(
+        self,
+        error: Exception,
+        field: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Handle a validation error during context update.
+        
+        Args:
+            error: The validation error
+            field: Field that caused the error
+            
+        Returns:
+            Error handling result dictionary
+        """
+        if self.error_handler:
+            context = {
+                "conversation_state": str(self.context.current_state),
+                "field": field,
+                "collected_fields": self.context.get_collected_fields(),
+            }
+            return self.error_handler.handle_error(error, context)
+        else:
+            # Fallback error handling
+            return {
+                "error_type": type(error).__name__,
+                "user_message": str(error),
+                "technical_message": str(error),
+                "recoverable": True,
+                "context": {"field": field},
+                "should_retry": False,
+            }
+    
+    def handle_timeout(self, timeout_seconds: int = 10) -> Dict[str, Any]:
+        """
+        Handle user timeout (no response).
+        
+        Args:
+            timeout_seconds: How long we waited
+            
+        Returns:
+            Error handling result with user message
+            
+        Raises:
+            UserTimeoutError: If max timeouts exceeded
+        """
+        self.timeout_count += 1
+        
+        logger.warning(
+            f"User timeout detected (count: {self.timeout_count}/{self.max_timeouts})"
+        )
+        
+        if self.enable_error_handling and ERROR_HANDLING_AVAILABLE:
+            error = UserTimeoutError(
+                f"No response for {timeout_seconds} seconds",
+                timeout_seconds=timeout_seconds,
+                retry_count=self.timeout_count - 1,
+                max_retries=self.max_timeouts
+            )
+            
+            context = {
+                "conversation_state": str(self.context.current_state),
+                "timeout_count": self.timeout_count,
+            }
+            
+            result = self.error_handler.handle_error(error, context, log_level="WARNING")
+            
+            # Check if we should end conversation
+            if self.timeout_count > self.max_timeouts:
+                result["should_end_conversation"] = True
+            
+            return result
+        else:
+            # Fallback
+            if self.timeout_count > self.max_timeouts:
+                return {
+                    "error_type": "UserTimeout",
+                    "user_message": "I haven't heard from you, so I'll end this call. Feel free to call back anytime.",
+                    "recoverable": False,
+                    "should_end_conversation": True,
+                }
+            else:
+                return {
+                    "error_type": "UserTimeout",
+                    "user_message": "I didn't hear anything. Are you still there?",
+                    "recoverable": True,
+                    "should_end_conversation": False,
+                }
+    
+    def reset_timeout_count(self) -> None:
+        """Reset the timeout counter when user responds."""
+        if self.timeout_count > 0:
+            logger.info(f"Resetting timeout count from {self.timeout_count}")
+            self.timeout_count = 0
+    
+    def handle_ambiguous_input(
+        self,
+        field: str,
+        possible_values: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Handle ambiguous or unclear user input.
+        
+        Args:
+            field: Field that has ambiguous input
+            possible_values: Possible interpretations of the input
+            
+        Returns:
+            Error handling result
+        """
+        if self.enable_error_handling and ERROR_HANDLING_AVAILABLE:
+            error = AmbiguousInputError(
+                f"Ambiguous input for {field}",
+                field=field,
+                possible_interpretations=possible_values
+            )
+            
+            context = {
+                "conversation_state": str(self.context.current_state),
+                "field": field,
+            }
+            
+            return self.error_handler.handle_error(error, context, log_level="INFO")
+        else:
+            # Fallback
+            return {
+                "error_type": "AmbiguousInput",
+                "user_message": f"I'm not quite sure I understood the {field}. Could you say that again more clearly?",
+                "recoverable": True,
+            }
+    
+    def get_conversation_context_for_error(self) -> Dict[str, Any]:
+        """
+        Get current conversation context for error logging.
+        
+        Returns:
+            Dictionary with conversation context
+        """
+        return {
+            "conversation_state": str(self.context.current_state),
+            "collected_fields": self.context.get_collected_fields(),
+            "missing_fields": self.get_missing_fields(),
+            "is_complete": self.context.is_complete(),
+            "timeout_count": self.timeout_count,
+        }
