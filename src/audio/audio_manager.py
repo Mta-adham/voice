@@ -14,6 +14,22 @@ from loguru import logger
 
 from .config import AudioConfig, DEFAULT_CONFIG
 
+# Import error handling
+try:
+    from ..error_handling.exceptions import (
+        AudioProcessingError,
+        TranscriptionError,
+        UserTimeoutError,
+    )
+    from ..error_handling.handlers import log_error_with_context
+    ERROR_HANDLING_AVAILABLE = True
+except ImportError:
+    # Fallback if error handling not available yet
+    ERROR_HANDLING_AVAILABLE = False
+    AudioProcessingError = Exception
+    TranscriptionError = Exception
+    UserTimeoutError = Exception
+
 
 class AudioDeviceError(Exception):
     """Raised when audio device is not available or lacks permissions."""
@@ -473,3 +489,175 @@ class AudioManager:
             self.cleanup()
         except Exception:
             pass  # Ignore errors during destruction
+    
+    # ========================================================================
+    # Enhanced Error Handling Methods
+    # ========================================================================
+    
+    def wait_for_speech(
+        self,
+        timeout: float = 10.0,
+        silence_threshold: Optional[float] = None,
+        silence_duration: float = 1.5
+    ) -> bool:
+        """
+        Wait for user to speak with timeout detection.
+        
+        This method records audio and waits for speech activity.
+        Returns True if speech detected, False if timeout occurred.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            silence_threshold: Silence detection threshold in dB
+            silence_duration: Minimum silence duration to consider speech ended
+            
+        Returns:
+            True if speech detected, False if timeout
+            
+        Raises:
+            UserTimeoutError: If user doesn't speak within timeout
+            AudioRecordingError: If recording fails
+        """
+        try:
+            self.start_recording()
+            start_time = time.time()
+            
+            # Wait for speech or timeout
+            while time.time() - start_time < timeout:
+                time.sleep(0.1)
+                
+                # Check if we have audio data
+                if self._audio_buffer and len(self._audio_buffer) > 0:
+                    # Check if silence is detected (meaning speech has occurred and ended)
+                    if self.detect_silence(silence_threshold, silence_duration):
+                        self.stop_recording()
+                        logger.info(f"Speech detected and completed in {time.time() - start_time:.2f}s")
+                        return True
+            
+            # Timeout occurred
+            self.stop_recording()
+            
+            # Check if any audio was captured
+            if not self._audio_buffer or len(self._audio_buffer) == 0:
+                logger.warning(f"User timeout: No speech detected in {timeout}s")
+                
+                if ERROR_HANDLING_AVAILABLE:
+                    raise UserTimeoutError(
+                        f"No speech detected within {timeout} seconds",
+                        user_message="I didn't hear anything. Are you still there?",
+                        timeout_seconds=int(timeout)
+                    )
+                else:
+                    return False
+            
+            return False
+            
+        except AudioRecordingError:
+            raise
+        except Exception as e:
+            logger.error(f"Error waiting for speech: {str(e)}")
+            if ERROR_HANDLING_AVAILABLE:
+                raise AudioProcessingError(
+                    f"Failed to wait for speech: {str(e)}",
+                    user_message="I'm having trouble with my audio system.",
+                    audio_type="recording",
+                    original_error=e
+                )
+            else:
+                raise AudioRecordingError(f"Failed to wait for speech: {str(e)}")
+    
+    def record_with_timeout(
+        self,
+        duration: float = 5.0,
+        detect_silence: bool = True,
+        silence_threshold: Optional[float] = None,
+        silence_duration: float = 1.0
+    ) -> Tuple[Optional[np.ndarray], Optional[int]]:
+        """
+        Record audio with automatic timeout and silence detection.
+        
+        Args:
+            duration: Maximum recording duration in seconds
+            detect_silence: Whether to stop recording on silence detection
+            silence_threshold: Silence threshold in dB (None = use config)
+            silence_duration: Minimum silence duration to stop (seconds)
+            
+        Returns:
+            Tuple of (audio_data, sample_rate) or (None, None) if timeout/no audio
+            
+        Raises:
+            AudioProcessingError: If recording fails
+        """
+        try:
+            self.start_recording()
+            start_time = time.time()
+            
+            while time.time() - start_time < duration:
+                time.sleep(0.1)
+                
+                # Check for silence if enabled
+                if detect_silence and self._audio_buffer:
+                    if self.detect_silence(silence_threshold, silence_duration):
+                        logger.info(f"Silence detected, stopping recording after {time.time() - start_time:.2f}s")
+                        break
+            
+            audio_data, sample_rate = self.stop_recording()
+            
+            # Check if any meaningful audio was captured
+            if len(audio_data) < int(0.1 * sample_rate):  # Less than 0.1 seconds
+                logger.warning("Insufficient audio captured (likely silence)")
+                
+                if ERROR_HANDLING_AVAILABLE:
+                    raise TranscriptionError(
+                        "Insufficient audio captured",
+                        user_message="I didn't catch that clearly. Could you repeat that?",
+                        reason="silence"
+                    )
+                else:
+                    return None, None
+            
+            return audio_data, sample_rate
+            
+        except (AudioRecordingError, AudioDeviceError):
+            raise
+        except Exception as e:
+            logger.error(f"Error recording with timeout: {str(e)}")
+            if ERROR_HANDLING_AVAILABLE:
+                raise AudioProcessingError(
+                    f"Failed to record audio: {str(e)}",
+                    user_message="I'm having trouble recording audio.",
+                    audio_type="recording",
+                    original_error=e
+                )
+            else:
+                raise AudioRecordingError(f"Failed to record audio: {str(e)}")
+    
+    def is_silent_audio(
+        self,
+        audio_data: np.ndarray,
+        threshold: Optional[float] = None
+    ) -> bool:
+        """
+        Check if audio data is silent (contains no speech).
+        
+        Args:
+            audio_data: Audio data to check
+            threshold: Silence threshold in dB (None = use config)
+            
+        Returns:
+            True if audio is silent, False otherwise
+        """
+        if threshold is None:
+            threshold = self.config.silence_threshold
+        
+        # Calculate RMS energy
+        rms = np.sqrt(np.mean(audio_data**2))
+        
+        # Avoid log(0)
+        if rms < 1e-10:
+            return True
+        
+        # Convert to dB
+        db_level = 20 * np.log10(rms)
+        
+        return db_level < threshold

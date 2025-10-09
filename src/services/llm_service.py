@@ -446,3 +446,176 @@ def llm_chat(
             provider=provider,
             original_error=e,
         )
+
+
+# ============================================================================
+# Provider Failover Logic
+# ============================================================================
+
+def llm_chat_with_failover(
+    messages: List[Dict[str, str]],
+    system_prompt: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 500,
+    preferred_provider: str = "openai",
+    fallback_providers: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """
+    Call LLM with automatic provider failover.
+    
+    If the preferred provider fails, automatically tries fallback providers.
+    This ensures the conversation can continue even if one LLM provider is down.
+    
+    Args:
+        messages: List of chat messages
+        system_prompt: Optional system prompt
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens to generate
+        preferred_provider: Preferred LLM provider to try first
+        fallback_providers: List of fallback providers to try if preferred fails.
+                           If None, uses all other supported providers.
+    
+    Returns:
+        Dictionary containing response from first successful provider
+    
+    Raises:
+        LLMError: If all providers fail
+    
+    Examples:
+        >>> # Try OpenAI first, fall back to Gemini then Claude
+        >>> response = llm_chat_with_failover(
+        ...     messages=[{"role": "user", "content": "Hello!"}],
+        ...     preferred_provider="openai",
+        ...     fallback_providers=["gemini", "claude"]
+        ... )
+        >>> print(response["content"])
+        "Hello! How can I help you?"
+    """
+    supported_providers = ["openai", "gemini", "claude"]
+    
+    # Validate preferred provider
+    if preferred_provider not in supported_providers:
+        logger.warning(
+            f"Invalid preferred provider '{preferred_provider}'. "
+            f"Using 'openai' as default."
+        )
+        preferred_provider = "openai"
+    
+    # Build provider list
+    if fallback_providers is None:
+        # Use all other providers as fallbacks
+        fallback_providers = [p for p in supported_providers if p != preferred_provider]
+    else:
+        # Validate fallback providers
+        fallback_providers = [p for p in fallback_providers if p in supported_providers]
+    
+    providers_to_try = [preferred_provider] + fallback_providers
+    
+    logger.debug(f"Provider failover order: {providers_to_try}")
+    
+    last_error = None
+    
+    for provider in providers_to_try:
+        try:
+            logger.info(f"Attempting LLM call with provider: {provider}")
+            result = llm_chat(
+                provider=provider,
+                messages=messages,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            
+            # Success!
+            if provider != preferred_provider:
+                logger.warning(
+                    f"Used fallback provider '{provider}' instead of '{preferred_provider}'"
+                )
+            
+            return result
+            
+        except LLMError as e:
+            last_error = e
+            logger.warning(f"Provider '{provider}' failed: {e}. Trying next provider...")
+            
+            # Check if this is an authentication error - skip to next provider
+            if "authentication" in str(e).lower() or "api key" in str(e).lower():
+                logger.info(f"Authentication error with {provider}, skipping to next provider")
+                continue
+            
+            # Check if this is a rate limit - might want to try backup immediately
+            if "rate limit" in str(e).lower():
+                logger.info(f"Rate limit hit on {provider}, trying fallback immediately")
+                continue
+            
+            # For other errors, still try fallbacks
+            continue
+            
+        except Exception as e:
+            last_error = e
+            logger.error(f"Unexpected error with provider '{provider}': {e}")
+            continue
+    
+    # All providers failed
+    error_msg = f"All LLM providers failed. Last error: {last_error}"
+    logger.error(error_msg)
+    
+    if isinstance(last_error, LLMError):
+        raise last_error
+    else:
+        raise LLMError(
+            error_msg,
+            provider="all",
+            original_error=last_error
+        )
+
+
+def get_available_providers() -> List[str]:
+    """
+    Get list of LLM providers that have valid API keys configured.
+    
+    Returns:
+        List of provider names that can be used
+    """
+    available = []
+    
+    for provider in ["openai", "gemini", "claude"]:
+        try:
+            get_api_key(provider)
+            available.append(provider)
+        except ValueError:
+            pass
+    
+    return available
+
+
+def select_best_provider(preferred: Optional[str] = None) -> str:
+    """
+    Select the best available LLM provider.
+    
+    Args:
+        preferred: Preferred provider name (if available)
+    
+    Returns:
+        Provider name to use
+    
+    Raises:
+        LLMError: If no providers are available
+    """
+    available = get_available_providers()
+    
+    if not available:
+        raise LLMError(
+            "No LLM providers available. Please configure at least one API key "
+            "(OPENAI_API_KEY, GEMINI_API_KEY, or ANTHROPIC_API_KEY)."
+        )
+    
+    # Use preferred if available
+    if preferred and preferred in available:
+        logger.info(f"Using preferred LLM provider: {preferred}")
+        return preferred
+    
+    # Otherwise use first available
+    selected = available[0]
+    logger.info(f"Using available LLM provider: {selected}")
+    return selected
